@@ -1,7 +1,7 @@
 package client
 
 import (
-	cs "github.com/alibabacloud-go/cs-20151215/v3/client"
+	cs "github.com/alibabacloud-go/cs-20151215/v5/client"
 	openapi "github.com/alibabacloud-go/darabonba-openapi/v2/client"
 	"testing"
 )
@@ -64,7 +64,7 @@ func TestACKClient_DescribeClusterAddonsVersion(t *testing.T) {
 		t.Skip("fail to create ack client, skip")
 	}
 
-	addon, err := client.DescribeClusterAddonsUpgradeStatus("<your-cluster-id>", "terway-eniip")
+	addon, err := client.GetClusterAddonInstance("<your-cluster-id>", "terway-eniip")
 	if err != nil {
 		t.Fatalf(err.Error())
 	}

@@ -3,10 +3,11 @@ package framework
 import (
 	"context"
 	"fmt"
-	"k8s.io/cloud-provider-alibaba-cloud/pkg/model/tag"
 	"strconv"
 	"strings"
 	"time"
+
+	"k8s.io/cloud-provider-alibaba-cloud/pkg/model/tag"
 
 	"github.com/alibabacloud-go/tea/tea"
 	v1 "k8s.io/api/core/v1"
@@ -33,17 +34,11 @@ func (f *Framework) ExpectNetworkLoadBalancerEqual(svc *v1.Service) error {
 	}
 
 	var retErr error
-	_ = wait.PollImmediate(10*time.Second, 3*time.Minute, func() (done bool, err error) {
-		defer func() {
-			if retErr != nil {
-				klog.Infof("error in this try: %s", retErr.Error())
-			}
-		}()
-
+	_ = wait.PollImmediate(10*time.Second, 2*time.Minute, func() (done bool, err error) {
 		svc, remote, err := f.FindNetworkLoadBalancer()
 		if err != nil {
-			retErr = fmt.Errorf("find loadbalancer: %w", err)
-			return false, nil
+			retErr = fmt.Errorf("FindNetworkLoadBalancer, error: %s", err.Error())
+			return false, err
 		}
 
 		// check whether the nlb and svc is reconciled
@@ -69,6 +64,11 @@ func (f *Framework) ExpectNetworkLoadBalancerEqual(svc *v1.Service) error {
 		retErr = nil
 		return true, nil
 	})
+	if retErr != nil {
+		events, _ := f.Client.KubeClient.GetSvcEventsMessages(svc.Name)
+		klog.Warningf("Error syncing load balancer, recent events for services:\n %s", util.PrettyJson(events))
+		klog.Error(retErr)
+	}
 
 	return retErr
 }
@@ -125,45 +125,88 @@ func (f *Framework) ExpectNetworkLoadBalancerDeleted(svc *v1.Service) error {
 		}
 		err = lbManager.Find(reqCtx, lbMdl)
 		if err != nil {
+			if strings.Contains(err.Error(), "ResourceNotFound.loadBalancer") && svc.Annotations[annotation.Annotation(annotation.LoadBalancerId)] != "" {
+				//A bad reuse, LB does not exist, ignore it
+				klog.Warningf("a bad reuse, LB %s does not exist, ignore it", svc.Annotations[annotation.Annotation(annotation.LoadBalancerId)])
+				return true, nil
+			}
 			return false, err
 		}
-		if lbMdl.LoadBalancerAttribute.LoadBalancerId != "" {
-			return false, nil
+		if svc.Annotations[annotation.Annotation(annotation.LoadBalancerId)] == "" {
+			if lbMdl.LoadBalancerAttribute.LoadBalancerId != "" {
+				klog.Warningf("nlb %s is not deleted yet", lbMdl.LoadBalancerAttribute.LoadBalancerId)
+				return false, nil
+			}
+		} else {
+			reusenlb := svc.Annotations[annotation.Annotation(annotation.LoadBalancerId)]
+			if lbMdl.LoadBalancerAttribute.LoadBalancerId != reusenlb {
+				return false, fmt.Errorf("the current load balancing %s is inconsistent with the reused load balancing %s",
+					lbMdl.LoadBalancerAttribute.LoadBalancerId, reusenlb)
+			}
+			if err := f.ExpectNetworkLoadBalancerClean(svc, lbMdl); err != nil {
+				klog.Warningf("nlb %s is not deleted yet, error: %s", lbMdl.LoadBalancerAttribute.LoadBalancerId, err.Error())
+				return false, err
+			}
 		}
+		klog.Infof("nlb %s is deleted successfully", lbMdl.LoadBalancerAttribute.LoadBalancerId)
 		return true, nil
 	})
 }
 
 func (f *Framework) FindNetworkLoadBalancer() (*v1.Service, *nlbmodel.NetworkLoadBalancer, error) {
 	// wait until service created successfully
-	var svc *v1.Service
-	err := wait.PollImmediate(10*time.Second, 60*time.Second, func() (done bool, err error) {
-		svc, err = f.Client.KubeClient.GetService()
+	var (
+		service  *v1.Service
+		remote   *nlbmodel.NetworkLoadBalancer
+		retryErr error
+	)
+	for retry := 0; ; retry++ {
+		time.Sleep(6 * time.Second)
+		if retry > 20 && retryErr != nil {
+			events, _ := f.Client.KubeClient.GetSvcEventsMessages(service.Name)
+			klog.Warningf("Error syncing load balancer, recent events for services:\n %s", util.PrettyJson(events))
+			return service, remote, retryErr
+		}
+		svc, err := f.Client.KubeClient.GetService()
 		if err != nil {
-			return false, nil
+			retryErr = err
+			continue
 		}
+		service = svc
+
 		klog.Infof("wait nlb service running, ingress: %+v", svc.Status.LoadBalancer.Ingress)
-		if len(svc.Status.LoadBalancer.Ingress) == 1 &&
-			(svc.Status.LoadBalancer.Ingress[0].IP != "" ||
-				svc.Status.LoadBalancer.Ingress[0].Hostname != "") {
-			return true, nil
+		if len(svc.Status.LoadBalancer.Ingress) < 1 {
+			retryErr = fmt.Errorf("timeout no svc.Status.LoadBalancer.Ingress")
+			continue
 		}
-		return false, nil
-	})
-	if err != nil {
-		return svc, nil, err
-	}
+		if svc.Status.LoadBalancer.Ingress[0].Hostname == "" && svc.Status.LoadBalancer.Ingress[0].IP == "" {
+			retryErr = fmt.Errorf("svc ingress hostname and ip are empty")
+			continue
+		}
+		klog.Infof("find nlb service %v", svc.Status.LoadBalancer.Ingress)
 
-	klog.Infof("try get nlb from svc %s", svc.Name)
+		lb, err := BuildNLBRemoteModel(f, svc)
+		if err != nil {
+			retryErr = fmt.Errorf("buildNLBRemoteModel, error: %s", err.Error())
+			continue
+		}
+		if lb.LoadBalancerAttribute.LoadBalancerId == "" {
+			retryErr = fmt.Errorf("remote nlb id is empty")
+			continue
+		}
+		klog.Infof("find nlb %s", lb.LoadBalancerAttribute.LoadBalancerId)
+		remote = lb
 
-	remote, err := buildNLBRemoteModel(f, svc)
-	if err != nil {
-		return svc, nil, fmt.Errorf("build nlb remote model error: %s", err.Error())
+		retryErr = nil
+		break
 	}
-	if remote.LoadBalancerAttribute.LoadBalancerId == "" {
-		return svc, nil, fmt.Errorf("nlb is nil")
+	if hostname := service.Status.LoadBalancer.Ingress[0].Hostname; hostname != "" {
+		if hostname != remote.LoadBalancerAttribute.DNSName {
+			klog.Warningf("dns name %s is not equal to expected %s", hostname, remote.LoadBalancerAttribute.DNSName)
+			return service, remote, fmt.Errorf("expected nlb dns name %s, got %s", hostname, remote.LoadBalancerAttribute.DNSName)
+		}
 	}
-	return svc, remote, nil
+	return service, remote, retryErr
 }
 
 func networkLoadBalancerAttrEqual(f *Framework, anno *annotation.AnnotationRequest, svc *v1.Service, nlb *nlbmodel.LoadBalancerAttribute) error {
@@ -190,6 +233,11 @@ func networkLoadBalancerAttrEqual(f *Framework, anno *annotation.AnnotationReque
 			if !found {
 				return fmt.Errorf("expected nlb zoneMappings %+v, got %+v", localMappings, nlb.ZoneMappings)
 			}
+		}
+	}
+	if reusenlb := anno.Get(annotation.LoadBalancerId); reusenlb != "" {
+		if reusenlb != nlb.LoadBalancerId {
+			return fmt.Errorf("expected reuse nlb id %s, got %s", reusenlb, nlb.LoadBalancerId)
 		}
 	}
 
@@ -220,6 +268,11 @@ func networkLoadBalancerAttrEqual(f *Framework, anno *annotation.AnnotationReque
 	if name := anno.Get(annotation.LoadBalancerName); name != "" {
 		if name != nlb.Name {
 			return fmt.Errorf("expected nlb name %s, got %s", name, nlb.Name)
+		}
+	}
+	if bandwidthPackageId := anno.Get(annotation.BandwidthPackageId); bandwidthPackageId != "" {
+		if bandwidthPackageId != tea.StringValue(nlb.BandwidthPackageId) {
+			return fmt.Errorf("expected BandwidthPackageId name %s, got %s", bandwidthPackageId, tea.StringValue(nlb.BandwidthPackageId))
 		}
 	}
 
@@ -364,7 +417,7 @@ func nlbVsgAttrEqual(f *Framework, reqCtx *svcCtx.RequestContext, remote *nlbmod
 	return nil
 }
 
-func buildNLBRemoteModel(f *Framework, svc *v1.Service) (*nlbmodel.NetworkLoadBalancer, error) {
+func BuildNLBRemoteModel(f *Framework, svc *v1.Service) (*nlbmodel.NetworkLoadBalancer, error) {
 	sgMgr, err := nlbv2.NewServerGroupManager(f.Client.RuntimeClient, f.Client.CloudClient)
 	if err != nil {
 		return nil, err

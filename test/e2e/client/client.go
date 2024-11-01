@@ -3,11 +3,15 @@ package client
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
+
 	vpcsdk "github.com/aliyun/alibaba-cloud-sdk-go/services/vpc"
 	"k8s.io/client-go/kubernetes"
 	ctrlCfg "k8s.io/cloud-provider-alibaba-cloud/pkg/config"
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/provider/alibaba"
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/provider/alibaba/base"
+	"k8s.io/cloud-provider-alibaba-cloud/pkg/provider/alibaba/cas"
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/provider/alibaba/ecs"
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/provider/alibaba/nlb"
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/provider/alibaba/pvtz"
@@ -15,10 +19,8 @@ import (
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/provider/alibaba/vpc"
 	"k8s.io/cloud-provider-alibaba-cloud/test/e2e/options"
 	"k8s.io/klog/v2"
-	"os"
 	runtime "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
-	"strings"
 )
 
 type E2EClient struct {
@@ -27,6 +29,8 @@ type E2EClient struct {
 	RuntimeClient runtime.Client
 	ACKClient     *ACKClient
 }
+
+var DefaultRetryTimes = 3
 
 func NewClient() (*E2EClient, error) {
 	ctrlCfg.ControllerCFG.CloudConfigPath = options.TestConfig.CloudConfig
@@ -54,6 +58,7 @@ func NewClient() (*E2EClient, error) {
 		PVTZProvider: pvtz.NewPVTZProvider(mgr),
 		VPCProvider:  vpc.NewVPCProvider(mgr),
 		NLBProvider:  nlb.NewNLBProvider(mgr),
+		CASProvider:  cas.NewCASProvider(mgr),
 	}
 
 	cfg := config.GetConfigOrDie()
@@ -106,6 +111,7 @@ func (client *E2EClient) InitOptions() error {
 	if err != nil {
 		return err
 	}
+	options.TestConfig.AckCluster = ack
 	options.TestConfig.ClusterType = *ack.ClusterType
 	if ack.SubnetCidr == nil || *ack.SubnetCidr == "" {
 		options.TestConfig.Network = options.Terway
@@ -118,6 +124,16 @@ func (client *E2EClient) InitOptions() error {
 			return err
 		}
 	}
+	// ccm version
+	addon, err := client.ACKClient.GetClusterAddonInstance(options.TestConfig.ClusterId, "cloud-controller-manager")
+	if err != nil || addon.Version == "" {
+		return fmt.Errorf("GetClusterAddonInstance ccm error: %s", err.Error())
+	}
+	if addon.Version == "" {
+		return fmt.Errorf("GetClusterAddonInstance ccm error:version is empty %v", addon)
+	}
+	klog.Info(addon)
+	options.TestConfig.CCM_Version = addon.Version
 
 	if options.TestConfig.VSwitchID == "" {
 		vswId, err := client.CloudClient.VswitchID()
@@ -147,12 +163,11 @@ func (client *E2EClient) InitOptions() error {
 			options.TestConfig.VPCID = *ack.VpcId
 		}
 	}
-
+	vsws, err := client.CloudClient.DescribeVSwitches(context.TODO(), options.TestConfig.VPCID)
+	if err != nil {
+		return err
+	}
 	if options.TestConfig.VSwitchID2 == "" {
-		vsws, err := client.CloudClient.DescribeVSwitches(context.TODO(), *ack.VpcId)
-		if err != nil {
-			return err
-		}
 		found := false
 		for _, v := range vsws {
 			if v.VSwitchId != options.TestConfig.VSwitchID {
@@ -162,7 +177,40 @@ func (client *E2EClient) InitOptions() error {
 			}
 		}
 		if !found {
-			klog.Warningf("vpc %s has no available vsws, VSwitchID2 is nil", *ack.VpcId)
+			klog.Warningf("vpc %s has no available vsws, VSwitchID2 is nil", options.TestConfig.VPCID)
+		}
+	}
+	if options.TestConfig.IPv6 {
+		for _, v := range vsws {
+			if v.Ipv6CidrBlock == "" {
+				options.TestConfig.IPv6 = false
+				klog.Warningf("vpc %s has no available ipv6 cidr, IPv6 is false", options.TestConfig.VPCID)
+				break
+			}
+		}
+		ipv6Gateways, err := client.CloudClient.DescribeIpv6Gateways(context.TODO(), options.TestConfig.VPCID)
+		if err != nil {
+			return err
+		}
+		if len(ipv6Gateways) == 0 {
+			klog.Warningf("vpc %s has no available ipv6 gateway, IPv6 is false", options.TestConfig.VPCID)
+			options.TestConfig.IPv6 = false
+			if options.TestConfig.AllowCreateCloudResource {
+				ipv6_Gateway, err := client.CloudClient.CreateIpv6Gateway(context.TODO(), options.TestConfig.VPCID)
+				if err != nil {
+					klog.Warningf("create ipv6 gateway error: %s", err.Error())
+					options.TestConfig.IPv6 = false
+				}
+				klog.Infof("for test create ipv6 gateway: %s", ipv6_Gateway)
+				options.TestConfig.IPv6 = true
+			}
+		} else {
+			for _, g := range ipv6Gateways {
+				if g.Status != "Available" {
+					options.TestConfig.IPv6 = false
+					klog.Warningf("vpc %s has no available ipv6 gateway, IPv6 is false", options.TestConfig.VPCID)
+				}
+			}
 		}
 	}
 
@@ -178,15 +226,19 @@ func (client *E2EClient) InitOptions() error {
 		options.TestConfig.SlaveZoneID = resources[0].SlaveZoneId
 	}
 
-	addon, err := client.ACKClient.DescribeClusterAddonsUpgradeStatus(options.TestConfig.ClusterId, "virtual-kubelet")
+	addon, err = client.ACKClient.GetClusterAddonInstance(options.TestConfig.ClusterId, "ack-virtual-node")
 	if err != nil {
-		return fmt.Errorf("DescribeClusterAddonsUpgradeStatus error: %s", err.Error())
-	}
-	if addon.Version == "" {
-		options.TestConfig.EnableVK = false
+		if strings.Contains(err.Error(), "AddonNotFound") {
+			options.TestConfig.EnableVK = false
+		} else {
+			return fmt.Errorf("GetClusterAddonInstance error: %s", err.Error())
+		}
 	} else {
-		options.TestConfig.EnableVK = true
+		if addon.Version != "" {
+			options.TestConfig.EnableVK = true
+		}
 	}
+	klog.Info(addon)
 
 	if options.TestConfig.CertID == "" || options.TestConfig.CertID2 == "" {
 		certs, err := client.CloudClient.DescribeServerCertificates(context.TODO())
@@ -215,57 +267,86 @@ func (client *E2EClient) InitOptions() error {
 			options.TestConfig.CACertID = cacerts[0]
 		}
 	}
-
-	if options.TestConfig.NLBZoneMaps == "" {
-		regions, err := client.CloudClient.NLBRegionIds()
-		if err != nil {
-			return err
-		}
-
-		found := false
-		for _, r := range regions {
-			if r == *ack.RegionId {
-				found = true
-				break
-			}
-		}
-		if found {
-			zones, err := client.CloudClient.NLBZoneIds(*ack.RegionId)
-			vsws, err := client.CloudClient.DescribeVSwitches(context.TODO(), *ack.VpcId)
+	// NLB test
+	if options.TestConfig.EnableNLBTest {
+		if options.TestConfig.NLBZoneMaps == "" {
+			regions, err := client.CloudClient.NLBRegionIds()
 			if err != nil {
 				return err
 			}
 
-			var results []vpcsdk.VSwitch
-			zoneMaps := make(map[string]bool)
-			for _, vsw := range vsws {
-				for _, zone := range zones {
-					if vsw.ZoneId == zone && !zoneMaps[zone] {
-						results = append(results, vsw)
-						zoneMaps[zone] = true
+			found := false
+			for _, r := range regions {
+				if r == *ack.RegionId {
+					found = true
+					break
+				}
+			}
+			if found {
+				zones, err := client.CloudClient.NLBZoneIds(*ack.RegionId)
+				vsws, err := client.CloudClient.DescribeVSwitches(context.TODO(), *ack.VpcId)
+				if err != nil {
+					return err
+				}
+
+				var results []vpcsdk.VSwitch
+				zoneMaps := make(map[string]bool)
+				for _, vsw := range vsws {
+					for _, zone := range zones {
+						if vsw.ZoneId == zone && !zoneMaps[zone] {
+							results = append(results, vsw)
+							zoneMaps[zone] = true
+							break
+						}
+					}
+
+					if len(results) >= 2 {
 						break
 					}
 				}
 
 				if len(results) >= 2 {
-					break
-				}
-			}
+					var mappings []string
+					for _, vsw := range results {
+						mappings = append(mappings, fmt.Sprintf("%s:%s", vsw.ZoneId, vsw.VSwitchId))
+					}
 
-			if len(results) >= 2 {
-				var mappings []string
-				for _, vsw := range results {
-					mappings = append(mappings, fmt.Sprintf("%s:%s", vsw.ZoneId, vsw.VSwitchId))
+					options.TestConfig.NLBZoneMaps = strings.Join(mappings, ",")
+					klog.Infof("NLBZoneMaps set to [%s]", options.TestConfig.NLBZoneMaps)
+				} else {
+					klog.Warningf("no enough vswitches in nlb supported zones, supported zones in region %s are [%v]", *ack.RegionId, zones)
+					klog.Warningln("no enough vswitches in nlb supported zones, close nlb test")
+					options.TestConfig.EnableNLBTest = false
 				}
 
-				options.TestConfig.NLBZoneMaps = strings.Join(mappings, ",")
-				klog.Infof("NLBZoneMaps set to [%s]", options.TestConfig.NLBZoneMaps)
 			} else {
-				klog.Warningf("no enough vswitches in nlb supported zones, supported zones in region %s are [%v]", *ack.RegionId, zones)
+				klog.Warningf("region %s does not support nlb, ZoneMaps is empty", *ack.RegionId)
+				klog.Warningln("cluster region %s does not support nlb, should select from %+v", ack.RegionId, regions)
+				options.TestConfig.EnableNLBTest = false
 			}
-
-		} else {
-			klog.Warningf("region %s does not support nlb, ZoneMaps is empty", *ack.RegionId)
+		}
+		if options.TestConfig.NLBCertID == "" || options.TestConfig.NLBCertID2 == "" {
+			ssl_certs, err := client.CloudClient.DescribeSSLCertificateList(context.TODO())
+			if err != nil {
+				return fmt.Errorf("DescribeSSLCertificateList error: %s", err.Error())
+			}
+			if len(ssl_certs) != 0 {
+				for _, ssl_cert := range ssl_certs {
+					if options.TestConfig.NLBCertID == "" {
+						options.TestConfig.NLBCertID = ssl_cert.CertIdentifier
+						continue
+					}
+					if options.TestConfig.NLBCertID2 == "" && ssl_cert.CertIdentifier != options.TestConfig.NLBCertID {
+						options.TestConfig.NLBCertID2 = ssl_cert.CertIdentifier
+					}
+				}
+			}
+		}
+		if options.TestConfig.CommonBandwidthPackageId == "" {
+			CBP, _ := client.CloudClient.DescribeCommonBandwidthPackages()
+			if len(CBP) > 0 {
+				options.TestConfig.CommonBandwidthPackageId = CBP[0].BandwidthPackageId
+			}
 		}
 	}
 	return nil

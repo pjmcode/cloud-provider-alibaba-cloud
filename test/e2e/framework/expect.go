@@ -4,6 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/alibabacloud-go/tea/tea"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -24,10 +29,6 @@ import (
 	"k8s.io/cloud-provider-alibaba-cloud/test/e2e/options"
 	"k8s.io/cloud-provider/api"
 	"k8s.io/klog/v2"
-	"os"
-	"strconv"
-	"strings"
-	"time"
 )
 
 func (f *Framework) ExpectLoadBalancerEqual(svc *v1.Service) error {
@@ -41,7 +42,7 @@ func (f *Framework) ExpectLoadBalancerEqual(svc *v1.Service) error {
 		// if not find slb, skip retry
 		svc, remote, err := f.FindLoadBalancer()
 		if err != nil {
-			retErr = err
+			retErr = fmt.Errorf("FindLoadBalancer, error: %s", err.Error())
 			return false, err
 		}
 
@@ -68,6 +69,11 @@ func (f *Framework) ExpectLoadBalancerEqual(svc *v1.Service) error {
 		retErr = nil
 		return true, nil
 	})
+	if retErr != nil {
+		events, _ := f.Client.KubeClient.GetSvcEventsMessages(svc.Name)
+		klog.Warningf("Error syncing load balancer, recent events for services:\n %s", util.PrettyJson(events))
+		klog.Error(retErr)
+	}
 
 	return retErr
 }
@@ -123,11 +129,30 @@ func (f *Framework) ExpectLoadBalancerDeleted(svc *v1.Service) error {
 		}
 		err = lbManager.Find(reqCtx, lbMdl)
 		if err != nil {
+			if strings.Contains(err.Error(), "InvalidLoadBalancerId.NotFound") && svc.Annotations[annotation.Annotation(annotation.LoadBalancerId)] != "" {
+				//A bad reuse, LB does not exist, ignore it
+				klog.Warningf("a bad reuse, LB %s does not exist, ignore it", svc.Annotations[annotation.Annotation(annotation.LoadBalancerId)])
+				return true, nil
+			}
 			return false, err
 		}
-		if lbMdl.LoadBalancerAttribute.LoadBalancerId != "" {
-			return false, nil
+		if svc.Annotations[annotation.Annotation(annotation.LoadBalancerId)] == "" {
+			if lbMdl.LoadBalancerAttribute.LoadBalancerId != "" {
+				klog.Warningf("clb %s is not deleted yet", lbMdl.LoadBalancerAttribute.LoadBalancerId)
+				return false, nil
+			}
+		} else {
+			reuseclb := svc.Annotations[annotation.Annotation(annotation.LoadBalancerId)]
+			if lbMdl.LoadBalancerAttribute.LoadBalancerId != reuseclb {
+				return false, fmt.Errorf("the current load balancing %s is inconsistent with the reused load balancing %s",
+					lbMdl.LoadBalancerAttribute.LoadBalancerId, reuseclb)
+			}
+			if err := f.ExpectLoadBalancerClean(svc, lbMdl); err != nil {
+				klog.Warningf("slb %s is not deleted yet, error: %s", lbMdl.LoadBalancerAttribute.LoadBalancerId, err.Error())
+				return false, err
+			}
 		}
+		klog.Infof("slb %s is deleted successfully", lbMdl.LoadBalancerAttribute.LoadBalancerId)
 		return true, nil
 	})
 }
@@ -169,6 +194,11 @@ func loadBalancerAttrEqual(f *Framework, anno *annotation.AnnotationRequest, svc
 					return fmt.Errorf("expected slb Bandwidth %s, got %d", Bandwidth, lb.Bandwidth)
 				}
 			}
+		}
+	}
+	if reuseclb := anno.Get(annotation.LoadBalancerId); reuseclb != "" {
+		if reuseclb != lb.LoadBalancerId {
+			return fmt.Errorf("expected reuse clb id %s, got %s", reuseclb, lb.LoadBalancerId)
 		}
 	}
 
@@ -1252,6 +1282,9 @@ func isNodeExcludeFromLoadBalancer(node *v1.Node, anno *annotation.AnnotationReq
 	if _, exclude := node.Labels[helper.LabelNodeExcludeBalancerDeprecated]; exclude {
 		return true
 	}
+	if node.Spec.Unschedulable {
+		return true
+	}
 
 	return false
 }
@@ -1271,6 +1304,9 @@ func (f *Framework) ExpectNodeEqual() error {
 		}
 		var instanceIds []string
 		for _, node := range nodes {
+			if isVKNode(node) {
+				continue
+			}
 			for _, taint := range node.Spec.Taints {
 				if taint.Key == api.TaintExternalCloudProvider {
 					retErr = fmt.Errorf("node %s has uninitialized taint", node.Name)
@@ -1336,6 +1372,13 @@ func findCloudTaint(taints []v1.Taint) *v1.Taint {
 	return nil
 }
 
+const (
+	ecsTagNodePoolID = "ack.alibabacloud.com/nodepool-id"
+
+	LabelNodePoolID         = "node.alibabacloud.com/nodepool-id"
+	LabelInstanceChargeType = "node.alibabacloud.com/instance-charge-type"
+)
+
 func isNodeAndInsEqual(node v1.Node, ins *prvd.NodeAttribute) bool {
 	typeEqual := node.Labels[v1.LabelInstanceType] == ins.InstanceType &&
 		node.Labels[v1.LabelInstanceTypeStable] == ins.InstanceType
@@ -1355,6 +1398,28 @@ func isNodeAndInsEqual(node v1.Node, ins *prvd.NodeAttribute) bool {
 			}
 		}
 		if !found {
+			klog.Warningf("node %s has no address %s", node.Name, add1.Address)
+			return false
+		}
+	}
+	if ins.InstanceChargeType != "" {
+		if node.Labels[LabelInstanceChargeType] != ins.InstanceChargeType {
+			klog.Warningf(
+				"node %s,expect Adding node label from cloud provider: %s=%s,but not found",
+				node.Name,
+				LabelInstanceChargeType, ins.InstanceChargeType,
+			)
+			return false
+		}
+	}
+
+	if nodePoolID, ok := ins.Tags[ecsTagNodePoolID]; ok {
+		if node.Labels[LabelNodePoolID] != nodePoolID {
+			klog.Warningf(
+				"node %s,expect Adding node label from cloud provider: %s=%s,but not found",
+				node.Name,
+				LabelNodePoolID, nodePoolID,
+			)
 			return false
 		}
 	}
@@ -1478,34 +1543,63 @@ func (f *Framework) ExpectRouteEqual() error {
 
 func (f *Framework) FindLoadBalancer() (*v1.Service, *model.LoadBalancer, error) {
 	// wait until service created successfully
-	var svc *v1.Service
-	err := wait.PollImmediate(5*time.Second, 30*time.Second, func() (done bool, err error) {
-		svc, err = f.Client.KubeClient.GetService()
+	var (
+		service  *v1.Service
+		remote   *model.LoadBalancer
+		retryErr error
+	)
+	for retry := 0; ; retry++ {
+		time.Sleep(6 * time.Second)
+		if retry > 20 && retryErr != nil {
+			events, _ := f.Client.KubeClient.GetSvcEventsMessages(service.Name)
+			klog.Warningf("Error syncing load balancer, recent events for services:\n %s", util.PrettyJson(events))
+			return service, remote, retryErr
+		}
+		svc, err := f.Client.KubeClient.GetService()
 		if err != nil {
-			return false, nil
+			retryErr = err
+			continue
 		}
-		if len(svc.Status.LoadBalancer.Ingress) == 1 &&
-			(svc.Status.LoadBalancer.Ingress[0].IP != "" ||
-				svc.Status.LoadBalancer.Ingress[0].Hostname != "") {
-			return true, nil
+		service = svc
+
+		klog.Infof("wait nlb service running, ingress: %+v", svc.Status.LoadBalancer.Ingress)
+		if len(svc.Status.LoadBalancer.Ingress) < 1 {
+			retryErr = fmt.Errorf("timeout no svc.Status.LoadBalancer.Ingress")
+			continue
 		}
-		return false, nil
-	})
-	if err != nil {
-		return svc, nil, err
+		if svc.Status.LoadBalancer.Ingress[0].Hostname == "" && svc.Status.LoadBalancer.Ingress[0].IP == "" {
+			retryErr = fmt.Errorf("svc ingress hostname and ip are empty")
+			continue
+		}
+		klog.Infof("find nlb service %v", svc.Status.LoadBalancer.Ingress)
+
+		lb, err := BuildClbRemoteModel(f, svc)
+		if err != nil {
+			retryErr = fmt.Errorf("buildNLBRemoteModel, error: %s", err.Error())
+			continue
+		}
+		if lb.LoadBalancerAttribute.LoadBalancerId == "" {
+			retryErr = fmt.Errorf("remote nlb id is empty")
+			continue
+		}
+		klog.Infof("find nlb %s", lb.LoadBalancerAttribute.LoadBalancerId)
+		remote = lb
+
+		retryErr = nil
+		break
+	}
+	//hostname Adding this annotation does not automatically bind the CLB instance to the domain name;so skip check it
+	if ip := service.Status.LoadBalancer.Ingress[0].IP; ip != "" {
+		if ip != remote.LoadBalancerAttribute.Address {
+			klog.Warningf("address %s is not equal to expected %s", ip, remote.LoadBalancerAttribute.Address)
+			return service, remote, fmt.Errorf("expected nlb Address %s, got %s", ip, remote.LoadBalancerAttribute.Address)
+		}
 	}
 
-	remote, err := buildRemoteModel(f, svc)
-	if err != nil {
-		return svc, nil, fmt.Errorf("build lb remote model error: %s", err.Error())
-	}
-	if remote.LoadBalancerAttribute.LoadBalancerId == "" {
-		return svc, nil, fmt.Errorf("slb is nil")
-	}
-	return svc, remote, nil
+	return service, remote, retryErr
 }
 
-func buildRemoteModel(f *Framework, svc *v1.Service) (*model.LoadBalancer, error) {
+func BuildClbRemoteModel(f *Framework, svc *v1.Service) (*model.LoadBalancer, error) {
 	builder := &clbv1.ModelBuilder{
 		LoadBalancerMgr: clbv1.NewLoadBalancerManager(f.Client.CloudClient),
 		ListenerMgr:     clbv1.NewListenerManager(f.Client.CloudClient),

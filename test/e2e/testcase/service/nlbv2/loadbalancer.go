@@ -2,16 +2,21 @@ package nlbv2
 
 import (
 	"context"
+	"strings"
+	"time"
+
+	"github.com/alibabacloud-go/tea/tea"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/controller/helper"
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/controller/service/reconcile/annotation"
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/model"
-	nlbmodel "k8s.io/cloud-provider-alibaba-cloud/pkg/model/nlb"
+	nlb_model "k8s.io/cloud-provider-alibaba-cloud/pkg/model/nlb"
 	"k8s.io/cloud-provider-alibaba-cloud/test/e2e/framework"
 	"k8s.io/cloud-provider-alibaba-cloud/test/e2e/options"
-	"strings"
+	"k8s.io/klog/v2"
 )
 
 func RunLoadBalancerTestCases(f *framework.Framework) {
@@ -20,7 +25,7 @@ func RunLoadBalancerTestCases(f *framework.Framework) {
 
 		ginkgo.AfterEach(func() {
 			ginkgo.By("delete service")
-			err := f.AfterEach()
+			err := f.AfterEachNlb()
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		})
 
@@ -33,6 +38,127 @@ func RunLoadBalancerTestCases(f *framework.Framework) {
 				err = f.ExpectNetworkLoadBalancerEqual(svc)
 				gomega.Expect(err).To(gomega.BeNil())
 			})
+		})
+		ginkgo.Context("after the service is deleted, the LB is retained", func() {
+			ginkgo.It("delete service & preserve LB", func() {
+				svc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
+					annotation.Annotation(annotation.ZoneMaps):           options.TestConfig.NLBZoneMaps,
+					annotation.Annotation(annotation.PreserveLBOnDelete): string(model.OnFlag),
+				})
+				gomega.Expect(err).To(gomega.BeNil())
+				err = f.ExpectNetworkLoadBalancerEqual(svc)
+				gomega.Expect(err).To(gomega.BeNil())
+				_, nlb, err := f.FindNetworkLoadBalancer()
+				gomega.Expect(err).To(gomega.BeNil())
+				defer func(id string) {
+					gomega.Expect(f.DeleteNetworkLoadBalancer(id)).To(gomega.BeNil())
+				}(nlb.LoadBalancerAttribute.LoadBalancerId)
+
+				ginkgo.By("delete service")
+				gomega.Expect(f.Client.KubeClient.DeleteService()).To(gomega.BeNil())
+				gomega.Consistently(func(g gomega.Gomega) {
+					lb, err := framework.BuildNLBRemoteModel(f, svc)
+					g.Expect(err).To(gomega.BeNil())
+					g.Expect(lb.LoadBalancerAttribute.LoadBalancerId).To(gomega.Equal(nlb.LoadBalancerAttribute.LoadBalancerId))
+				}, 10*time.Second, 30*time.Second).Should(gomega.Succeed())
+
+			})
+
+		})
+		ginkgo.Context("bandwidth-package-id", func() {
+			if options.TestConfig.CommonBandwidthPackageId != "" &&
+				framework.CompareVersion(options.TestConfig.CCM_Version, "2.9.1") {
+				ginkgo.It("Bind a shared bandwidth package", func() {
+					svc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
+						annotation.Annotation(annotation.ZoneMaps):           options.TestConfig.NLBZoneMaps,
+						annotation.Annotation(annotation.BandwidthPackageId): options.TestConfig.CommonBandwidthPackageId,
+					})
+					gomega.Expect(err).To(gomega.BeNil())
+					err = f.ExpectNetworkLoadBalancerEqual(svc)
+					gomega.Expect(err).To(gomega.BeNil())
+				})
+				ginkgo.It("Bind a invalid bandwidth-package-id", func() {
+					svc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
+						annotation.Annotation(annotation.ZoneMaps):           options.TestConfig.NLBZoneMaps,
+						annotation.Annotation(annotation.BandwidthPackageId): "cbwp-xxxxxx",
+					})
+					gomega.Expect(err).To(gomega.BeNil())
+					err = f.ExpectNetworkLoadBalancerEqual(svc)
+					gomega.Expect(err).NotTo(gomega.BeNil())
+				})
+				if options.TestConfig.InternetNetworkLoadBalancerID != "" && options.TestConfig.IntranetNetworkLoadBalancerID != "" {
+					ginkgo.It("reuse internet lb", func() {
+						svc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
+							annotation.Annotation(annotation.ZoneMaps):           options.TestConfig.NLBZoneMaps,
+							annotation.Annotation(annotation.AddressType):        string(model.InternetAddressType),
+							annotation.Annotation(annotation.LoadBalancerId):     options.TestConfig.InternetNetworkLoadBalancerID,
+							annotation.Annotation(annotation.BandwidthPackageId): options.TestConfig.CommonBandwidthPackageId,
+						})
+						gomega.Expect(err).To(gomega.BeNil())
+						err = f.ExpectNetworkLoadBalancerEqual(svc)
+						gomega.Expect(err).To(gomega.BeNil())
+					})
+					ginkgo.It("reuse intranet lb", func() {
+						svc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
+							annotation.Annotation(annotation.ZoneMaps):           options.TestConfig.NLBZoneMaps,
+							annotation.Annotation(annotation.AddressType):        string(model.IntranetAddressType),
+							annotation.Annotation(annotation.LoadBalancerId):     options.TestConfig.IntranetNetworkLoadBalancerID,
+							annotation.Annotation(annotation.BandwidthPackageId): options.TestConfig.CommonBandwidthPackageId,
+						})
+						gomega.Expect(err).To(gomega.BeNil())
+						err = f.ExpectNetworkLoadBalancerEqual(svc)
+						gomega.Expect(err).NotTo(gomega.BeNil())
+					})
+				}
+
+			}
+
+		})
+		ginkgo.Context("readinessGate", func() {
+			if framework.EnableReadinessGate() {
+				ginkgo.It("readinessGate", func() {
+					oldsvc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
+						annotation.Annotation(annotation.ZoneMaps): options.TestConfig.NLBZoneMaps,
+					})
+					gomega.Expect(err).To(gomega.BeNil())
+					err = f.ExpectNetworkLoadBalancerEqual(oldsvc)
+					gomega.Expect(err).To(gomega.BeNil())
+					ginkgo.By("readinessGate")
+					app, err := f.Client.KubeClient.GetDefaultDeployment()
+					gomega.Expect(err).To(gomega.BeNil())
+					cond := "service.readiness.alibabacloud.com/" + oldsvc.Name
+					app.Spec.Template.Spec.ReadinessGates = append(
+						app.Spec.Template.Spec.ReadinessGates, v1.PodReadinessGate{
+							ConditionType: helper.BuildReadinessGatePodConditionType(
+								cond,
+							),
+						})
+					app, err = f.Client.KubeClient.UpdateDeployment(app)
+					gomega.Expect(err).To(gomega.BeNil())
+					gomega.Eventually(func(g gomega.Gomega) {
+						pods, err := f.Client.KubeClient.ListPods(metav1.FormatLabelSelector(app.Spec.Selector))
+						g.Expect(err).To(gomega.BeNil())
+						g.Expect(pods.Items).To(gomega.HaveLen(3))
+					}).WithPolling(5*time.Second).WithTimeout(1*time.Minute).Should(gomega.Succeed(), "test app should has 3 pods")
+					pods, err := f.Client.KubeClient.ListPods(metav1.FormatLabelSelector(app.Spec.Selector))
+					gomega.Expect(err).To(gomega.BeNil())
+					// All ready pods should have a readinessGate
+					ok := func() bool {
+						for _, pod := range pods.Items {
+							if !f.Client.KubeClient.IsPodHasReadinessGate(&pod, cond) {
+								klog.Errorf("pod %s not has readinessGate %s cond", pod.Name, cond)
+								return false
+							}
+						}
+						return true
+					}
+					gomega.Eventually(ok, 10*time.Second, 30*time.Second).Should(gomega.BeTrue(), "all ready pods should has readinessGate")
+					err = f.ExpectNetworkLoadBalancerEqual(oldsvc)
+					gomega.Expect(err).To(gomega.BeNil())
+
+				})
+			}
+
 		})
 
 		ginkgo.Context("nlb address-type", func() {
@@ -99,7 +225,7 @@ func RunLoadBalancerTestCases(f *framework.Framework) {
 				gomega.Expect(err).To(gomega.BeNil())
 			})
 
-			if options.TestConfig.IPv6 {
+			if options.TestConfig.IPv6 && tea.StringValue(options.TestConfig.AckCluster.ProxyMode) == "ipvs" {
 				ginkgo.It("ipv6-address-type=internet", func() {
 					svc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
 						annotation.Annotation(annotation.ZoneMaps):        options.TestConfig.NLBZoneMaps,
@@ -161,7 +287,7 @@ func RunLoadBalancerTestCases(f *framework.Framework) {
 		})
 
 		ginkgo.Context("nlb reuse lb", func() {
-			if options.TestConfig.InternetNetworkLoadBalancerID != "" {
+			if options.TestConfig.InternetNetworkLoadBalancerID != "" && options.TestConfig.IntranetNetworkLoadBalancerID != "" {
 				ginkgo.It("reuse internet lb", func() {
 					svc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
 						annotation.Annotation(annotation.ZoneMaps):       options.TestConfig.NLBZoneMaps,
@@ -220,7 +346,7 @@ func RunLoadBalancerTestCases(f *framework.Framework) {
 					gomega.Expect(err).To(gomega.BeNil())
 
 					err = f.ExpectNetworkLoadBalancerEqual(newsvc)
-					gomega.Expect(err).To(gomega.BeNil())
+					gomega.Expect(err).NotTo(gomega.BeNil())
 				})
 
 				ginkgo.It("reuse intranet nlb with override-listener=true", func() {
@@ -306,51 +432,52 @@ func RunLoadBalancerTestCases(f *framework.Framework) {
 				err = f.ExpectNetworkLoadBalancerEqual(svc)
 				gomega.Expect(err).To(gomega.BeNil())
 			})
-
-			ginkgo.It("ip-version: dualstack", func() {
-				svc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
-					annotation.Annotation(annotation.ZoneMaps):  options.TestConfig.NLBZoneMaps,
-					annotation.Annotation(annotation.IPVersion): string(model.DualStack),
+			if options.TestConfig.IPv6 {
+				ginkgo.It("ip-version: dualstack", func() {
+					svc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
+						annotation.Annotation(annotation.ZoneMaps):  options.TestConfig.NLBZoneMaps,
+						annotation.Annotation(annotation.IPVersion): string(model.DualStack),
+					})
+					gomega.Expect(err).To(gomega.BeNil())
+					err = f.ExpectNetworkLoadBalancerEqual(svc)
+					gomega.Expect(err).To(gomega.BeNil())
 				})
-				gomega.Expect(err).To(gomega.BeNil())
-				err = f.ExpectNetworkLoadBalancerEqual(svc)
-				gomega.Expect(err).To(gomega.BeNil())
-			})
 
-			ginkgo.It("lb-version: ipv4 -> dualstack", func() {
-				oldSvc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
-					annotation.Annotation(annotation.ZoneMaps): options.TestConfig.NLBZoneMaps,
+				ginkgo.It("lb-version: ipv4 -> dualstack", func() {
+					oldSvc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
+						annotation.Annotation(annotation.ZoneMaps): options.TestConfig.NLBZoneMaps,
+					})
+					gomega.Expect(err).To(gomega.BeNil())
+					err = f.ExpectNetworkLoadBalancerEqual(oldSvc)
+					gomega.Expect(err).To(gomega.BeNil())
+
+					newSvc := oldSvc.DeepCopy()
+					newSvc.Annotations[annotation.Annotation(annotation.IPVersion)] = string(model.DualStack)
+					newSvc, err = f.Client.KubeClient.PatchService(oldSvc, newSvc)
+					gomega.Expect(err).To(gomega.BeNil())
+
+					err = f.ExpectNetworkLoadBalancerEqual(newSvc)
+					gomega.Expect(err).NotTo(gomega.BeNil())
 				})
-				gomega.Expect(err).To(gomega.BeNil())
-				err = f.ExpectNetworkLoadBalancerEqual(oldSvc)
-				gomega.Expect(err).To(gomega.BeNil())
 
-				newSvc := oldSvc.DeepCopy()
-				newSvc.Annotations[annotation.Annotation(annotation.IPVersion)] = string(model.DualStack)
-				newSvc, err = f.Client.KubeClient.PatchService(oldSvc, newSvc)
-				gomega.Expect(err).To(gomega.BeNil())
+				ginkgo.It("lb-version: dualstack -> ipv4", func() {
+					oldSvc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
+						annotation.Annotation(annotation.ZoneMaps):  options.TestConfig.NLBZoneMaps,
+						annotation.Annotation(annotation.IPVersion): string(model.DualStack),
+					})
+					gomega.Expect(err).To(gomega.BeNil())
+					err = f.ExpectNetworkLoadBalancerEqual(oldSvc)
+					gomega.Expect(err).To(gomega.BeNil())
 
-				err = f.ExpectNetworkLoadBalancerEqual(newSvc)
-				gomega.Expect(err).NotTo(gomega.BeNil())
-			})
+					newSvc := oldSvc.DeepCopy()
+					newSvc.Annotations[annotation.Annotation(annotation.IPVersion)] = string(model.IPv4)
+					newSvc, err = f.Client.KubeClient.PatchService(oldSvc, newSvc)
+					gomega.Expect(err).To(gomega.BeNil())
 
-			ginkgo.It("lb-version: dualstack -> ipv4", func() {
-				oldSvc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
-					annotation.Annotation(annotation.ZoneMaps):  options.TestConfig.NLBZoneMaps,
-					annotation.Annotation(annotation.IPVersion): string(model.DualStack),
+					err = f.ExpectNetworkLoadBalancerEqual(newSvc)
+					gomega.Expect(err).NotTo(gomega.BeNil())
 				})
-				gomega.Expect(err).To(gomega.BeNil())
-				err = f.ExpectNetworkLoadBalancerEqual(oldSvc)
-				gomega.Expect(err).To(gomega.BeNil())
-
-				newSvc := oldSvc.DeepCopy()
-				newSvc.Annotations[annotation.Annotation(annotation.IPVersion)] = string(model.IPv4)
-				newSvc, err = f.Client.KubeClient.PatchService(oldSvc, newSvc)
-				gomega.Expect(err).To(gomega.BeNil())
-
-				err = f.ExpectNetworkLoadBalancerEqual(newSvc)
-				gomega.Expect(err).NotTo(gomega.BeNil())
-			})
+			}
 		})
 
 		if options.TestConfig.ResourceGroupID != "" {
@@ -491,10 +618,14 @@ func RunLoadBalancerTestCases(f *framework.Framework) {
 
 				err = f.ExpectNetworkLoadBalancerDeleted(npSvc)
 				gomega.Expect(err).To(gomega.BeNil())
-				svc, err := f.Client.KubeClient.GetService()
-				gomega.Expect(err).To(gomega.BeNil())
-				gomega.Expect(svc.Labels).ShouldNot(gomega.HaveKey(helper.LabelServiceHash))
-				gomega.Expect(svc.Labels).ShouldNot(gomega.HaveKey(helper.LabelLoadBalancerId))
+
+				gomega.Eventually(func(g gomega.Gomega) {
+					svc, err := f.Client.KubeClient.GetService()
+					g.Expect(err).To(gomega.BeNil())
+					g.Expect(svc.Labels).ShouldNot(gomega.HaveKey(helper.LabelServiceHash))
+					g.Expect(svc.Labels).ShouldNot(gomega.HaveKey(helper.LabelLoadBalancerId))
+				}).WithPolling(10 * time.Second).WithTimeout(2 * time.Minute).Should(gomega.Succeed())
+
 			})
 			ginkgo.It("type: ClusterIP -> LoadBalancer", func() {
 				svc := f.Client.KubeClient.DefaultService()
@@ -550,6 +681,7 @@ func RunLoadBalancerTestCases(f *framework.Framework) {
 				gomega.Expect(err).To(gomega.BeNil())
 
 				_, slb, err := f.FindNetworkLoadBalancer()
+				gomega.Expect(err).To(gomega.BeNil())
 				err = f.DeleteNetworkLoadBalancer(slb.LoadBalancerAttribute.LoadBalancerId)
 				gomega.Expect(err).To(gomega.BeNil())
 
@@ -575,13 +707,15 @@ func RunLoadBalancerTestCases(f *framework.Framework) {
 				_, nlb, err := f.FindNetworkLoadBalancer()
 				gomega.Expect(err).To(gomega.BeNil())
 				key := helper.TAGKEY
-				err = f.Client.CloudClient.UntagNLBResources(context.TODO(), nlb.LoadBalancerAttribute.LoadBalancerId, nlbmodel.LoadBalancerTagType, []*string{&key})
+				err = f.Client.CloudClient.UntagNLBResources(context.TODO(), nlb.LoadBalancerAttribute.LoadBalancerId, nlb_model.LoadBalancerTagType, []*string{&key})
 				gomega.Expect(err).To(gomega.BeNil())
 
 				err = f.Client.KubeClient.ScaleDeployment(0)
 				gomega.Expect(err).To(gomega.BeNil())
 				defer func() {
 					err = f.Client.KubeClient.ScaleDeployment(3)
+					gomega.Expect(err).To(gomega.BeNil())
+					err = f.DeleteNetworkLoadBalancer(nlb.LoadBalancerAttribute.LoadBalancerId)
 					gomega.Expect(err).To(gomega.BeNil())
 				}()
 
@@ -607,16 +741,18 @@ func RunLoadBalancerTestCases(f *framework.Framework) {
 				err = f.ExpectNetworkLoadBalancerEqual(oldSvc)
 				gomega.Expect(err).To(gomega.BeNil())
 
-				_, slb, err := f.FindNetworkLoadBalancer()
+				_, nlb, err := f.FindNetworkLoadBalancer()
 				gomega.Expect(err).To(gomega.BeNil())
 				key := helper.TAGKEY
-				err = f.Client.CloudClient.UntagNLBResources(context.TODO(), slb.LoadBalancerAttribute.LoadBalancerId, nlbmodel.LoadBalancerTagType, []*string{&key})
+				err = f.Client.CloudClient.UntagNLBResources(context.TODO(), nlb.LoadBalancerAttribute.LoadBalancerId, nlb_model.LoadBalancerTagType, []*string{&key})
 				gomega.Expect(err).To(gomega.BeNil())
 
 				err = f.Client.KubeClient.ScaleDeployment(0)
 				gomega.Expect(err).To(gomega.BeNil())
 				defer func() {
 					err = f.Client.KubeClient.ScaleDeployment(3)
+					gomega.Expect(err).To(gomega.BeNil())
+					err = f.DeleteNetworkLoadBalancer(nlb.LoadBalancerAttribute.LoadBalancerId)
 					gomega.Expect(err).To(gomega.BeNil())
 				}()
 

@@ -9,7 +9,7 @@ import (
 )
 
 func RunNodeControllerTestCases(f *framework.Framework) {
-	ginkgo.Describe("node controller", func() {
+	ginkgo.Describe("[AskSkip][addonName:cloud-controller-manager]node controller", func() {
 
 		ginkgo.Context("reconcile", func() {
 			ginkgo.It("node-reconcile", func() {
@@ -44,7 +44,7 @@ func RunNodeControllerTestCases(f *framework.Framework) {
 			})
 		})
 
-		ginkgo.Context("add-node", func() {
+		ginkgo.Context("[P0][smoke]add-node", func() {
 			ginkgo.It("add-node", func() {
 				if options.TestConfig.ClusterId != "" {
 					// created svc
@@ -67,11 +67,18 @@ func RunNodeControllerTestCases(f *framework.Framework) {
 					// check service whether equal
 					err = f.ExpectLoadBalancerEqual(svc)
 					gomega.Expect(err).To(gomega.BeNil())
+
+					//Prevent scheduling of other services
+					node, err := f.Client.KubeClient.GetLatestNode()
+					gomega.Expect(err).To(gomega.BeNil())
+					// add node taint
+					ginkgo.By("Prevent scheduling of other services add node:" + node.Name)
+					gomega.Expect(f.Client.KubeClient.AddTaint(node.Name, v1.Taint{Key: "ccm-e2e", Effect: "NoSchedule"})).To(gomega.BeNil())
 				}
 			})
 		})
 
-		ginkgo.Context("remove-node", func() {
+		ginkgo.Context("[P0][smoke]remove-node", func() {
 			ginkgo.It("remove-node", func() {
 				if options.TestConfig.ClusterId != "" {
 					// svc created
@@ -82,6 +89,7 @@ func RunNodeControllerTestCases(f *framework.Framework) {
 					}()
 					// delete node
 					node, err := f.Client.KubeClient.GetLatestNode()
+					ginkgo.By("Prevent scheduling of other services remove node:" + node.Name)
 					gomega.Expect(err).To(gomega.BeNil())
 					gomega.Expect(node).NotTo(gomega.BeNil())
 					err = f.Client.ACKClient.DeleteClusterNodes(options.TestConfig.ClusterId, node.Name)

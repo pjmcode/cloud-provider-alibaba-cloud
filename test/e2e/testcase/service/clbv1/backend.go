@@ -2,9 +2,10 @@ package clbv1
 
 import (
 	"fmt"
+	"time"
+
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/controller/helper"
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/controller/service/reconcile/annotation"
-	"time"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
@@ -18,14 +19,14 @@ import (
 
 func RunBackendTestCases(f *framework.Framework) {
 
-	ginkgo.Describe("clb service controller: backend", func() {
+	ginkgo.Describe("[addonName:cloud-controller-manager]clb service controller: backend", func() {
 		ginkgo.AfterEach(func() {
 			ginkgo.By("delete service")
-			err := f.AfterEach()
+			err := f.AfterEachClb()
 			gomega.Expect(err).To(gomega.BeNil())
 		})
 
-		ginkgo.Context("backend-label", func() {
+		ginkgo.Context("[AskSkip]backend-label", func() {
 			ginkgo.It("backend-label", func() {
 				// label node
 				node, err := f.Client.KubeClient.GetLatestNode()
@@ -98,7 +99,7 @@ func RunBackendTestCases(f *framework.Framework) {
 			}
 		})
 
-		ginkgo.Context("remove-unscheduled-backend", func() {
+		ginkgo.Context("[AskSkip]remove-unscheduled-backend", func() {
 			ginkgo.It("remove-unscheduled-backend: off; node: unschedulable -> schedulable", func() {
 				// unscheduled node
 				node, err := f.Client.KubeClient.GetLatestNode()
@@ -142,7 +143,7 @@ func RunBackendTestCases(f *framework.Framework) {
 			})
 		})
 
-		ginkgo.Context("to-be-deleted-taint", func() {
+		ginkgo.Context("[AskSkip]to-be-deleted-taint", func() {
 			ginkgo.It("node: to-be-deleted-taint", func() {
 				taint := v1.Taint{
 					Key:    helper.ToBeDeletedTaint,
@@ -180,7 +181,7 @@ func RunBackendTestCases(f *framework.Framework) {
 					gomega.Expect(err).To(gomega.BeNil())
 				})
 
-				ginkgo.It("backend-type: eni -> ecs", func() {
+				ginkgo.It("[AskSkip]backend-type: eni -> ecs", func() {
 					oldSvc, err := f.Client.KubeClient.CreateServiceByAnno(map[string]string{
 						annotation.BackendType: model.ENIBackendType,
 					})
@@ -330,7 +331,7 @@ func RunBackendTestCases(f *framework.Framework) {
 						err = f.ExpectLoadBalancerEqual(newSvc)
 						gomega.Expect(err).To(gomega.BeNil())
 					})
-					ginkgo.It("ecs mode; weight: nil -> 80", func() {
+					ginkgo.It("[AskSkip]ecs mode; weight: nil -> 80", func() {
 						vGroupPort := fmt.Sprintf("%s:%d", options.TestConfig.VServerGroupID, 80)
 						svc := f.Client.KubeClient.DefaultService()
 						svc.Annotations = map[string]string{
@@ -524,7 +525,7 @@ func RunBackendTestCases(f *framework.Framework) {
 			}
 		})
 
-		ginkgo.Context("exclude-balancer", func() {
+		ginkgo.Context("[AskSkip]exclude-balancer", func() {
 			ginkgo.It("exclude-balancer", func() {
 				// label node
 				node, err := f.Client.KubeClient.GetLatestNode()
@@ -543,7 +544,7 @@ func RunBackendTestCases(f *framework.Framework) {
 			})
 		})
 
-		ginkgo.Context("exclude-node", func() {
+		ginkgo.Context("[AskSkip]exclude-node", func() {
 			ginkgo.It("exclude-node", func() {
 				// label node
 				node, err := f.Client.KubeClient.GetLatestNode()
@@ -562,7 +563,7 @@ func RunBackendTestCases(f *framework.Framework) {
 			})
 		})
 
-		ginkgo.Context("update-backend", func() {
+		ginkgo.Context("[P0][smoke]update-backend", func() {
 			ginkgo.It("scale deploy", func() {
 				rawsvc := f.Client.KubeClient.DefaultService()
 				rawsvc.Spec.ExternalTrafficPolicy = v1.ServiceExternalTrafficPolicyTypeLocal

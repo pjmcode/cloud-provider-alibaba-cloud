@@ -2,10 +2,11 @@ package nlbv2
 
 import (
 	"fmt"
+	"time"
+
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/controller/helper"
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/controller/service/reconcile/annotation"
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/model/nlb"
-	"time"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
@@ -22,7 +23,7 @@ func RunBackendTestCases(f *framework.Framework) {
 	ginkgo.Describe("nlb service controller: backend", func() {
 		ginkgo.AfterEach(func() {
 			ginkgo.By("delete service")
-			err := f.AfterEach()
+			err := f.AfterEachNlb()
 			gomega.Expect(err).To(gomega.BeNil())
 		})
 
@@ -340,7 +341,7 @@ func RunBackendTestCases(f *framework.Framework) {
 			}
 		})
 
-		ginkgo.Context("to-be-deleted-taint", func() {
+		ginkgo.Context("[AskSkip]to-be-deleted-taint", func() {
 			ginkgo.It("node: to-be-deleted-taint", func() {
 				taint := v1.Taint{
 					Key:    helper.ToBeDeletedTaint,
@@ -385,7 +386,7 @@ func RunBackendTestCases(f *framework.Framework) {
 					gomega.Expect(err).To(gomega.BeNil())
 				})
 
-				ginkgo.It("backend-type: eni -> ecs", func() {
+				ginkgo.It("[AskSkip]backend-type: eni -> ecs", func() {
 					oldSvc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
 						annotation.BackendType:                             model.ENIBackendType,
 						annotation.Annotation(annotation.ZoneMaps):         options.TestConfig.NLBZoneMaps,
@@ -407,7 +408,7 @@ func RunBackendTestCases(f *framework.Framework) {
 			})
 		}
 
-		ginkgo.Context("special endpoints", func() {
+		ginkgo.Context("[AskSkip]special endpoints", func() {
 			ginkgo.It("service with no selector", func() {
 				svc, err := f.Client.KubeClient.CreateNLBServiceWithoutSelector(map[string]string{
 					annotation.Annotation(annotation.ZoneMaps):         options.TestConfig.NLBZoneMaps,
@@ -450,7 +451,7 @@ func RunBackendTestCases(f *framework.Framework) {
 		})
 
 		ginkgo.Context("target port", func() {
-			ginkgo.It("targetPort: 80 -> 81; ecs mode", func() {
+			ginkgo.It("[AskSkip]targetPort: 80 -> 81; ecs mode", func() {
 				oldSvc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
 					annotation.Annotation(annotation.ZoneMaps):         options.TestConfig.NLBZoneMaps,
 					annotation.Annotation(annotation.LoadBalancerId):   options.TestConfig.InternetNetworkLoadBalancerID,
@@ -581,7 +582,7 @@ func RunBackendTestCases(f *framework.Framework) {
 			}
 		})
 
-		ginkgo.Context("exclude-balancer", func() {
+		ginkgo.Context("[AskSkip]exclude-balancer", func() {
 			ginkgo.It("exclude-balancer", func() {
 				// label node
 				node, err := f.Client.KubeClient.GetLatestNode()
@@ -604,7 +605,7 @@ func RunBackendTestCases(f *framework.Framework) {
 			})
 		})
 
-		ginkgo.Context("exclude-node", func() {
+		ginkgo.Context("[AskSkip]exclude-node", func() {
 			ginkgo.It("exclude-node", func() {
 				// label node
 				node, err := f.Client.KubeClient.GetLatestNode()
@@ -809,7 +810,7 @@ func RunBackendTestCases(f *framework.Framework) {
 						err = f.ExpectNetworkLoadBalancerEqual(newSvc)
 						gomega.Expect(err).To(gomega.BeNil())
 					})
-					ginkgo.It("ecs mode; weight: nil -> 80", func() {
+					ginkgo.It("[AskSkip]ecs mode; weight: nil -> 80", func() {
 						vGroupPort := fmt.Sprintf("%s:%d", options.TestConfig.NLBServerGroupID, 80)
 						svc := f.Client.KubeClient.DefaultNLBService()
 						svc.Annotations = map[string]string{

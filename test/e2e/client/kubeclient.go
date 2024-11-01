@@ -1,12 +1,16 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/alibabacloud-go/tea/tea"
+	"io"
+	"os"
 	"strings"
 	"time"
+
+	"github.com/alibabacloud-go/tea/tea"
 
 	appv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
@@ -18,15 +22,16 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/controller/helper"
+	"k8s.io/cloud-provider-alibaba-cloud/test/e2e/options"
 	"k8s.io/klog/v2"
 )
 
 const (
-	Namespace        = "e2e-test"
+	Namespace        = "ccm-e2e-test"
 	Service          = "basic-service"
-	Deployment       = "nginx"
-	VKDeployment     = "nginx-vk"
-	NodeLabel        = "e2etest"
+	Deployment       = "ccm-nginx"
+	VKDeployment     = "ccm-nginx-vk"
+	NodeLabel        = "ccme2etest"
 	ExcludeNodeLabel = "service.beta.kubernetes.io/exclude-node"
 )
 
@@ -36,6 +41,28 @@ type KubeClient struct {
 
 func NewKubeClient(client kubernetes.Interface) *KubeClient {
 	return &KubeClient{client}
+}
+
+func IsOversea() bool {
+	region := options.TestConfig.RegionId
+	if region != "" {
+		klog.Infof("check region is domestic or oversea: %s", region)
+		if strings.Contains(region, "cn-hongkong") {
+			return true
+		}
+		return !strings.Contains(region, "cn-")
+	}
+	return false
+}
+func GetTestImage() string {
+	if os.Getenv("TEST_IMAGE") != "" {
+		return os.Getenv("TEST_IMAGE")
+	}
+	image := "ack-cn-hangzhou-registry.cn-hangzhou.cr.aliyuncs.com/test/nginx-multiarch:latest"
+	if IsOversea() {
+		image = "ack-cn-hongkong-registry.cn-hongkong.cr.aliyuncs.com/test/nginx-multiarch:latest"
+	}
+	return image
 }
 
 // service
@@ -315,9 +342,71 @@ func (client *KubeClient) CreateEndpointsWithNotExistNode() (*v1.Endpoints, erro
 	return client.CoreV1().Endpoints(Namespace).Create(context.TODO(), ep, metav1.CreateOptions{})
 }
 
+func ConditionsToString(conditions []v1.PodCondition) string {
+	var buffer bytes.Buffer
+	for _, condition := range conditions {
+		buffer.WriteString(fmt.Sprintf("%s: %s", string(condition.Type), condition.Status))
+		if condition.Message != "" {
+			buffer.WriteString(fmt.Sprintf("(%s)", condition.Message))
+		}
+		buffer.WriteString("; ")
+	}
+	return buffer.String()
+}
+
+// 等待 pod running
+func (kc *KubeClient) WaitPodRunningOrComplete(timeout time.Duration, labelSelector, namespace string) error {
+	// waiting for pod to be completed
+	waitErr := wait.PollImmediate(time.Second*2, timeout, func() (done bool, err error) {
+		pods, err := kc.CoreV1().Pods(Namespace).List(context.Background(), metav1.ListOptions{LabelSelector: labelSelector})
+		if err != nil {
+			klog.Infof("LabelSelector %s get pod err: %s", labelSelector, err.Error())
+			return false, nil
+		}
+		for _, pod := range pods.Items {
+			pod, err := kc.CoreV1().Pods(namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
+			if err != nil {
+				klog.Warningf("retry get pod %s err: %s", pod.Name, err.Error())
+				return false, nil
+			}
+			phase := pod.Status.Phase
+			klog.Infof("pod %s phase: %s", pod.Name, phase)
+			switch pod.Status.Phase {
+			case v1.PodRunning:
+				klog.Infof("pod %s status: %s", pod.Name, pod.Status.Phase)
+				continue
+			case v1.PodPending:
+				klog.Errorf("pod Pending: %s", ConditionsToString(pod.Status.Conditions))
+				return false, nil
+			case v1.PodFailed:
+				req := kc.CoreV1().Pods(namespace).GetLogs(pod.Name, &v1.PodLogOptions{})
+				stream, err := req.Stream(context.TODO())
+				if err != nil {
+					klog.Errorf("get log of pods:%s return err:%s", pod.Name, err.Error())
+				}
+				defer stream.Close()
+				data, err := io.ReadAll(stream)
+				if err != nil {
+					klog.Errorf("get log of pods:%s return err:%s", pod.Name, err.Error())
+				}
+				klog.Infof("pod:%s,  pod log:%s", pod.Name, string(data))
+				return false, fmt.Errorf("pod:%s,  pod log:%s", pod.Name, string(data))
+			default:
+				klog.Errorf("pod %s status: %s", pod.Name, pod.Status.Phase)
+				return false, nil
+			}
+		}
+		return true, nil
+
+	})
+
+	return waitErr
+}
+
 // deployment
 func (client *KubeClient) CreateDeployment() error {
 	var replica int32 = 3
+	test_iamge := GetTestImage()
 	nginx := &appv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      Deployment,
@@ -343,7 +432,7 @@ func (client *KubeClient) CreateDeployment() error {
 					Containers: []v1.Container{
 						{
 							Name:            "nginx",
-							Image:           "registry.cn-hangzhou.aliyuncs.com/acs-sample/nginx:latest",
+							Image:           test_iamge,
 							ImagePullPolicy: "Always",
 							Ports: []v1.ContainerPort{
 								{
@@ -370,25 +459,7 @@ func (client *KubeClient) CreateDeployment() error {
 			return fmt.Errorf("create nginx error: %s", err.Error())
 		}
 	}
-	return wait.Poll(5*time.Second, 2*time.Minute, func() (done bool, err error) {
-		pods, err := client.CoreV1().Pods(nginx.Namespace).List(context.Background(), metav1.ListOptions{LabelSelector: "run=nginx"})
-		if err != nil {
-			klog.Infof("wait for nginx pod ready: %s", err.Error())
-			return false, nil
-		}
-		if len(pods.Items) != int(*nginx.Spec.Replicas) {
-			klog.Infof("wait for nginx pod replicas: %d", len(pods.Items))
-			return false, nil
-		}
-		for _, pod := range pods.Items {
-			if pod.Status.Phase != "Running" {
-				klog.Infof("wait for nginx pod Running: %s", pod.Name)
-				return false, nil
-			}
-		}
-		return true, nil
-	},
-	)
+	return client.WaitPodRunningOrComplete(2*time.Minute, "run=nginx", Namespace)
 }
 
 func (client *KubeClient) ScaleDeployment(replica int32) error {
@@ -408,21 +479,74 @@ func (client *KubeClient) ScaleDeployment(replica int32) error {
 			return false, nil
 		}
 		if len(pods.Items) != int(replica) {
-			klog.Infof("wait for nginx pod replicas: %d", len(pods.Items))
+			klog.Infof("wait for nginx pod replicas: cur %d expect %d", len(pods.Items), replica)
 			return false, nil
 		}
 		for _, pod := range pods.Items {
 			if pod.Status.Phase != "Running" {
-				klog.Infof("wait for nginx pod Running: %s", pod.Name)
+				klog.Infof("wait for nginx pod Running: %s cur %v", pod.Name, pod.Status.Phase)
+				cond := ConditionsToString(pod.Status.Conditions)
+				klog.Infof("pod %s conditions: %s", pod.Name, cond)
 				return false, nil
 			}
 		}
+		klog.Infof("ScaleDeployment %s replica %d ok.", Deployment, replica)
 		return true, nil
 	})
 }
 
+func (client *KubeClient) CreateECIPod() error {
+	test_image := GetTestImage()
+	nginx := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      VKDeployment,
+			Namespace: Namespace,
+			Labels: map[string]string{
+				"app":                  "nginx-vk",
+				"alibabacloud.com/eci": "true",
+			},
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name:            "nginx",
+					Image:           test_image,
+					ImagePullPolicy: v1.PullIfNotPresent,
+					Ports: []v1.ContainerPort{
+						{
+							Name:          "http",
+							ContainerPort: 80,
+							Protocol:      v1.ProtocolTCP,
+						},
+						{
+							Name:          "https",
+							ContainerPort: 443,
+							Protocol:      v1.ProtocolTCP,
+						},
+					},
+				},
+			},
+			Tolerations: []v1.Toleration{
+				{
+					Operator: v1.TolerationOpExists,
+				},
+			},
+		},
+	}
+
+	_, err := client.CoreV1().Pods(Namespace).Create(context.Background(), nginx, metav1.CreateOptions{})
+	if err != nil {
+		if !strings.Contains(err.Error(), "exists") {
+			return fmt.Errorf("create nginx error: %s", err.Error())
+		}
+	}
+	return client.WaitPodRunningOrComplete(5*time.Minute, "app=nginx-vk", Namespace)
+
+}
+
 func (client *KubeClient) CreateVKDeployment() error {
 	var replica int32 = 2
+	test_iamge := GetTestImage()
 	nginx := &appv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      VKDeployment,
@@ -451,7 +575,7 @@ func (client *KubeClient) CreateVKDeployment() error {
 					Containers: []v1.Container{
 						{
 							Name:            "nginx",
-							Image:           "nginx:1.9.7",
+							Image:           test_iamge,
 							ImagePullPolicy: "Always",
 							Ports: []v1.ContainerPort{
 								{
@@ -506,6 +630,45 @@ func (client *KubeClient) CreateVKDeployment() error {
 	},
 	)
 
+}
+
+func (client *KubeClient) GetVkNodes(retry int) ([]v1.Node, error) {
+	nodes, err := client.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{LabelSelector: "type=virtual-kubelet"})
+	if err != nil {
+		return nil, err
+	}
+	if len(nodes.Items) == 0 && retry > 0 {
+		retry--
+		time.Sleep(5 * time.Second)
+		return client.GetVkNodes(retry)
+	}
+	if len(nodes.Items) == 0 {
+		return nil, fmt.Errorf("no vk nodes")
+	}
+	return nodes.Items, nil
+}
+
+func (client *KubeClient) GetVkPods(retry int) (vkPods []v1.Pod, err error) {
+	nodeName := "virtual-kubelet-" + options.TestConfig.RegionId
+	pods, err := client.CoreV1().Pods(Namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: "app=nginx-vk"})
+	if err != nil {
+		return nil, err
+	}
+	for _, pod := range pods.Items {
+		if strings.HasPrefix(pod.Spec.NodeName, nodeName) {
+			vkPods = append(vkPods, pod)
+		}
+	}
+	if len(vkPods) == 0 && retry > 0 {
+		retry--
+		time.Sleep(5 * time.Second)
+		return client.GetVkPods(retry)
+	}
+	if len(vkPods) == 0 {
+		return nil, fmt.Errorf("no vk pods")
+	}
+
+	return
 }
 
 // namespace
@@ -691,4 +854,70 @@ func (client *KubeClient) PatchNode(oldNode, newNode *v1.Node) (*v1.Node, error)
 	}
 	return client.CoreV1().Nodes().Patch(context.TODO(), oldNode.Name,
 		types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{})
+}
+
+func (client *KubeClient) GetDefaultDeployment() (*appv1.Deployment, error) {
+	app, err := client.AppsV1().Deployments(Namespace).Get(context.TODO(), Deployment, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get deployment %s error: %s", Deployment, err)
+	}
+	return app, nil
+}
+
+func (client *KubeClient) UpdateDeployment(app *appv1.Deployment) (*appv1.Deployment, error) {
+	app, err := client.AppsV1().Deployments(Namespace).Update(context.TODO(), app, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("update deployment %s error: %s", Deployment, err)
+	}
+	labelSelector := metav1.FormatLabelSelector(app.Spec.Selector)
+	return app, client.WaitPodRunningOrComplete(5*time.Minute, labelSelector, Namespace)
+}
+
+func (client *KubeClient) ListPods(labelSelector string) (*v1.PodList, error) {
+	pods, err := client.CoreV1().Pods(Namespace).List(context.TODO(), metav1.ListOptions{
+		LabelSelector: labelSelector,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list pods %s error: %s", labelSelector, err)
+	}
+	return pods, nil
+}
+
+func reverse(s []v1.Event) []v1.Event {
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		s[i], s[j] = s[j], s[i]
+	}
+	return s
+}
+
+func (client *KubeClient) GetEvents(name string) (*v1.EventList, error) {
+	fieldSelector := "involvedObject.name=" + name
+	return client.CoreV1().Events(Namespace).List(context.TODO(), metav1.ListOptions{FieldSelector: fieldSelector})
+}
+
+func (client *KubeClient) GetSvcEventsMessages(name string) (messgaes []string, err error) {
+	events, err := client.GetEvents(name)
+	if err != nil {
+		return nil, err
+	}
+	items := reverse(events.Items)
+	for _, v := range items {
+		if strings.Contains(v.Reason, "Failed") {
+			errMess := fmt.Sprintf("[%v][%s][%s]", v.LastTimestamp, v.Reason, v.Message)
+			messgaes = append(messgaes, errMess)
+		}
+		if len(messgaes) > 1 {
+			break
+		}
+	}
+	return
+}
+func (client *KubeClient) IsPodHasReadinessGate(pod *v1.Pod, cond string) bool {
+	conditionType := v1.PodConditionType(cond)
+	for _, cd := range pod.Status.Conditions {
+		if cd.Type == conditionType && cd.Status == v1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }

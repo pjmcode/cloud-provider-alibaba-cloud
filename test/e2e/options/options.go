@@ -3,10 +3,13 @@ package options
 import (
 	"flag"
 	"fmt"
+
+	"github.com/alibabacloud-go/cs-20151215/v5/client"
 )
 
 const (
-	Terway  = "terway"
+	//If network not eni, it defaults to flannel
+	Terway  = "terway-eni"
 	Flannel = "flannel"
 )
 
@@ -21,12 +24,16 @@ type E2EConfig struct {
 	AllowCreateCloudResource bool   `json:"allowCreateCloudResource"` // whether to create cloud resources for test
 
 	// need provided
-	VPCLoadBalancerID string `json:"VPCLoadBalancerID"` // lb in other vpc
-	EipLoadBalancerID string `json:"EipLoadBalancerID"` // intranet slb with eip
-	ResourceGroupID   string `json:"ResourceGroupID"`
-	NLBZoneMaps       string `json:"NLBZoneMaps"`
-	SecurityGroupIDs  string `json:"SecurityGroupIDs"`
-	IPv6              bool   `json:"ipv6"`
+	VPCLoadBalancerID      string `json:"VPCLoadBalancerID"` // lb in other vpc
+	EipLoadBalancerID      string `json:"EipLoadBalancerID"` // intranet slb with eip
+	ResourceGroupID        string `json:"ResourceGroupID"`
+	NLBZoneMaps            string `json:"NLBZoneMaps"`
+	SecurityGroupIDs       string `json:"SecurityGroupIDs"`
+	EnableNLBTest          bool   `json:"enableNLBTest"`
+	EnableCLBTest          bool   `json:"enableCLBTest"`
+	EnableMultiVpcTables   bool   `json:"enableMultiVpcTables"`   //Need to open a whitelist for the account
+	EnableSwitchChargeType bool   `json:"enableSwitchChargeType"` //Need to open a whitelist for the account
+	IPv6                   bool   `json:"ipv6"`
 
 	// described by cluster info
 	Network      string `json:"network"`
@@ -43,6 +50,8 @@ type E2EConfig struct {
 	NLBCertID    string `json:"NLBCertID"`
 	NLBCertID2   string `json:"NLBCertID2"`
 	NLBCACertID  string `json:"NLBCACertID"`
+	AckCluster   *client.DescribeClusterDetailResponseBody
+	CCM_Version  string `json:"ccmVersion"`
 
 	// created automatically if AllowCreateCloudResource=true
 	InternetLoadBalancerID        string `json:"InternetLoadBalancerID"`
@@ -55,6 +64,7 @@ type E2EConfig struct {
 	NLBServerGroupID2             string `json:"NLBServerGroupID2"`
 	AclID                         string `json:"AclID"`
 	AclID2                        string `json:"AclID2"`
+	CommonBandwidthPackageId      string `json:"CommonBandwidthPackage"`
 }
 
 func (e *E2EConfig) BindFlags() {
@@ -91,7 +101,12 @@ func (e *E2EConfig) BindFlags() {
 	flag.StringVar(&e.NLBZoneMaps, "nlb-zone-maps", "", "nlb zone maps")
 	flag.StringVar(&e.SecurityGroupIDs, "security-group-ids", "", "security group ids used by nlb tests")
 	flag.StringVar(&e.Address, "address", "", "loadbalancer address")
-	flag.BoolVar(&e.IPv6, "ipv6", false, "ipv6")
+	flag.BoolVar(&e.EnableNLBTest, "enableNLBTest", false, "enable NLB test")
+	flag.BoolVar(&e.EnableCLBTest, "enableCLBTest", false, "enable CLB test")
+	flag.BoolVar(&e.EnableMultiVpcTables, "enableMultiVpcTables", false, "enable multi vpc tables test,need to manually activate the whitelist for the account")
+	flag.BoolVar(&e.EnableSwitchChargeType, "enableSwitchChargeType", false, "enable switch instance-charge-type: PayByCLCU -> PayBySpec,need to manually activate the whitelist for the account")
+	flag.BoolVar(&e.IPv6, "ipv6", true, "if IPv6 is enabled over the Internet, an IPv6 gateway must exist in the VPC where the NLB instance resides")
+	flag.StringVar(&e.CommonBandwidthPackageId, "common-bandwidth-package-id", "", "The ID of the shared bandwidth plan to which you bind.")
 }
 
 func (e *E2EConfig) Validate() error {

@@ -1,11 +1,13 @@
 package client
 
 import (
+	"encoding/json"
 	"fmt"
-	"k8s.io/cloud-provider-alibaba-cloud/test/e2e/options"
 	"time"
 
-	cs "github.com/alibabacloud-go/cs-20151215/v3/client"
+	"k8s.io/cloud-provider-alibaba-cloud/test/e2e/options"
+
+	cs "github.com/alibabacloud-go/cs-20151215/v5/client"
 	openapi "github.com/alibabacloud-go/darabonba-openapi/v2/client"
 	"github.com/alibabacloud-go/tea/tea"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -47,7 +49,7 @@ func (e *ACKClient) DescribeClusterDetail(clusterId string) (*cs.DescribeCluster
 }
 
 func (e *ACKClient) getDefaultNodePool(clusterId string) (*string, error) {
-	detail, err := e.client.DescribeClusterNodePools(tea.String(clusterId))
+	detail, err := e.client.DescribeClusterNodePools(tea.String(clusterId), &cs.DescribeClusterNodePoolsRequest{})
 	if err != nil {
 		return nil, err
 	}
@@ -123,47 +125,27 @@ type AddonInfo struct {
 	Version       string
 }
 
-func (e *ACKClient) DescribeClusterAddonsUpgradeStatus(clusterId string, componentId string) (*AddonInfo, error) {
-	req := &cs.DescribeClusterAddonsUpgradeStatusRequest{
-		ComponentIds: []*string{tea.String(componentId)},
-	}
-	resp, err := e.client.DescribeClusterAddonsUpgradeStatus(tea.String(clusterId), req)
+func (e *ACKClient) GetClusterAddonInstance(clusterId string, componentId string) (*AddonInfo, error) {
+	resp, err := e.client.GetClusterAddonInstance(tea.String(clusterId), tea.String(componentId))
 	if err != nil {
-		return nil, err
-	}
-	if resp == nil {
-		return nil, fmt.Errorf("DescribeClusterAddonsUpgradeStatus resp is nil")
-	}
-	for key, value := range resp.Body {
-		if key == componentId {
-			addonInfo := value.(map[string]interface{})["addon_info"].(map[string]interface{})
-			return &AddonInfo{
-				ComponentName: addonInfo["component_name"].(string),
-				Version:       addonInfo["version"].(string),
-			}, nil
-		}
+		return nil, fmt.Errorf("GetClusterAddonInstance %s failed %s", componentId, err)
 	}
 
-	return nil, fmt.Errorf("DescribeClusterAddonsUpgradeStatus resp body %v do not contains %s", resp.Body, componentId)
+	return &AddonInfo{
+		ComponentName: *resp.Body.Name,
+		Version:       *resp.Body.Version,
+	}, nil
 }
 
 func (e *ACKClient) ModifyClusterConfiguration(clusterId string, addonName string, configs map[string]string) error {
-	var customizeConfigs []*cs.ModifyClusterConfigurationRequestCustomizeConfigConfigs
-	for k, v := range configs {
-		customizeConfigs = append(customizeConfigs, &cs.ModifyClusterConfigurationRequestCustomizeConfigConfigs{
-			Key:   tea.String(k),
-			Value: tea.String(v),
-		})
+	bytes, _err := json.Marshal(configs)
+	if _err != nil {
+		return _err
 	}
 
-	req := &cs.ModifyClusterConfigurationRequest{
-		CustomizeConfig: []*cs.ModifyClusterConfigurationRequestCustomizeConfig{
-			{
-				Name:    tea.String(addonName),
-				Configs: customizeConfigs,
-			},
-		},
+	req := &cs.ModifyClusterAddonRequest{
+		Config: tea.String(string(bytes)),
 	}
-	_, err := e.client.ModifyClusterConfiguration(tea.String(clusterId), req)
+	_, err := e.client.ModifyClusterAddon(tea.String(clusterId), tea.String(addonName), req)
 	return err
 }

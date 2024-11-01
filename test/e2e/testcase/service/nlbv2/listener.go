@@ -17,7 +17,7 @@ func RunListenerTestCases(f *framework.Framework) {
 
 		ginkgo.AfterEach(func() {
 			ginkgo.By("delete service")
-			err := f.AfterEach()
+			err := f.AfterEachNlb()
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		})
 
@@ -417,6 +417,26 @@ func RunListenerTestCases(f *framework.Framework) {
 					gomega.Expect(err).To(gomega.BeNil())
 				})
 
+				ginkgo.It("alpn: off -> on without alpn-policy", func() {
+					oldsvc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
+						annotation.Annotation(annotation.LoadBalancerId):   options.TestConfig.InternetNetworkLoadBalancerID,
+						annotation.Annotation(annotation.ProtocolPort):     "tcpssl:443",
+						annotation.Annotation(annotation.CertID):           options.TestConfig.NLBCertID,
+						annotation.Annotation(annotation.OverrideListener): "true",
+						annotation.Annotation(annotation.AlpnEnabled):      string(model.OffFlag),
+					})
+					gomega.Expect(err).To(gomega.BeNil())
+					err = f.ExpectNetworkLoadBalancerEqual(oldsvc)
+					gomega.Expect(err).To(gomega.BeNil())
+
+					newsvc := oldsvc.DeepCopy()
+					newsvc.Annotations[annotation.Annotation(annotation.AlpnEnabled)] = string(model.OnFlag)
+					newsvc, err = f.Client.KubeClient.PatchService(oldsvc, newsvc)
+					gomega.Expect(err).To(gomega.BeNil())
+					err = f.ExpectNetworkLoadBalancerEqual(newsvc)
+					gomega.Expect(err).NotTo(gomega.BeNil())
+				})
+
 				ginkgo.It("alpn: on -> off", func() {
 					oldsvc, err := f.Client.KubeClient.CreateNLBServiceByAnno(map[string]string{
 						annotation.Annotation(annotation.LoadBalancerId):   options.TestConfig.InternetNetworkLoadBalancerID,
@@ -667,8 +687,9 @@ func RunListenerTestCases(f *framework.Framework) {
 		})
 
 		ginkgo.Context("idle timeout", func() {
-			ginkgo.It("idle-timeout 60", func() {
+			ginkgo.It("tcp idle-timeout 60", func() {
 				svc := testsvc.DeepCopy()
+				svc.Annotations[annotation.Annotation(annotation.ProtocolPort)] = "tcp:80"
 				svc.Annotations[annotation.Annotation(annotation.IdleTimeout)] = "60"
 				svc, err := f.Client.KubeClient.CreateService(svc)
 				gomega.Expect(err).To(gomega.BeNil())
@@ -676,15 +697,16 @@ func RunListenerTestCases(f *framework.Framework) {
 				gomega.Expect(err).To(gomega.BeNil())
 			})
 
-			ginkgo.It("idle timeout default -> 60", func() {
+			ginkgo.It("udp idle timeout default -> 90", func() {
 				oldsvc := testsvc.DeepCopy()
+				oldsvc.Annotations[annotation.Annotation(annotation.ProtocolPort)] = "udp:53"
 				oldsvc, err := f.Client.KubeClient.CreateService(oldsvc)
 				gomega.Expect(err).To(gomega.BeNil())
 				err = f.ExpectNetworkLoadBalancerEqual(oldsvc)
 				gomega.Expect(err).To(gomega.BeNil())
 
 				newsvc := oldsvc.DeepCopy()
-				newsvc.Annotations[annotation.Annotation(annotation.IdleTimeout)] = "60"
+				newsvc.Annotations[annotation.Annotation(annotation.IdleTimeout)] = "90"
 				newsvc, err = f.Client.KubeClient.PatchService(oldsvc, newsvc)
 				gomega.Expect(err).To(gomega.BeNil())
 				err = f.ExpectNetworkLoadBalancerEqual(newsvc)

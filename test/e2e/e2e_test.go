@@ -1,6 +1,9 @@
 package e2e
 
 import (
+	"strings"
+	"testing"
+
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/util"
@@ -12,8 +15,6 @@ import (
 	"k8s.io/cloud-provider-alibaba-cloud/test/e2e/testcase/service/clbv1"
 	"k8s.io/cloud-provider-alibaba-cloud/test/e2e/testcase/service/nlbv2"
 	"k8s.io/klog/v2"
-	"strings"
-	"testing"
 )
 
 func init() {
@@ -66,23 +67,28 @@ func AddControllerTests(f *framework.Framework) {
 		klog.Info("no controller tests need to run, finished")
 		return
 	}
+	if !options.TestConfig.EnableNLBTest && !options.TestConfig.EnableCLBTest {
+		klog.Warningf("enableCLBTest and enableNLBTest are both false, skip service controller tests")
+	}
 	for _, c := range controllers {
 		switch c {
 		case "service":
-			ginkgo.Describe("clb service controller tests", func() {
-				clbv1.RunLoadBalancerTestCases(f)
-				clbv1.RunListenerTestCases(f)
-				clbv1.RunBackendTestCases(f)
-			})
+			if options.TestConfig.EnableCLBTest {
+				ginkgo.Describe("clb service controller tests", func() {
+					clbv1.RunLoadBalancerTestCases(f)
+					clbv1.RunListenerTestCases(f)
+					clbv1.RunBackendTestCases(f)
+				})
+			}
 
-			if options.TestConfig.NLBZoneMaps != "" {
+			if options.TestConfig.NLBZoneMaps != "" && options.TestConfig.EnableNLBTest {
 				ginkgo.Describe("nlb service controller tests", func() {
 					nlbv2.RunLoadBalancerTestCases(f)
 					nlbv2.RunListenerTestCases(f)
 					nlbv2.RunBackendTestCases(f)
 				})
 			} else {
-				klog.Warningf("NLBZoneMaps is empty, skip NLB service tests")
+				klog.Warningf("NLBZoneMaps is empty or not EnableNLBTest, skip NLB service tests")
 			}
 
 		case "node":

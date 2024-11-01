@@ -3,9 +3,11 @@ package framework
 import (
 	"context"
 	"fmt"
-	"k8s.io/cloud-provider-alibaba-cloud/pkg/controller/service/reconcile/annotation"
+	"os"
+	"strconv"
 	"strings"
 
+	"github.com/alibabacloud-go/tea/tea"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/model"
 	nlbmodel "k8s.io/cloud-provider-alibaba-cloud/pkg/model/nlb"
@@ -21,6 +23,7 @@ const (
 	SLBResource = "SLB"
 	NLBResource = "NLB"
 	ACLResource = "ACL"
+	CBPResource = "CommonBandwidthPackage"
 )
 
 type Framework struct {
@@ -52,7 +55,13 @@ func (f *Framework) BeforeSuit() error {
 	}
 
 	if options.TestConfig.EnableVK {
-		if err := f.Client.KubeClient.CreateVKDeployment(); err != nil {
+		if err := f.Client.KubeClient.CreateECIPod(); err != nil {
+			return err
+		}
+		if _, err := f.Client.KubeClient.GetVkNodes(10); err != nil {
+			return err
+		}
+		if _, err := f.Client.KubeClient.GetVkPods(10); err != nil {
 			return err
 		}
 	}
@@ -68,7 +77,23 @@ func (f *Framework) AfterSuit() error {
 	return f.CleanCloudResources()
 }
 
-func (f *Framework) AfterEach() error {
+func (f *Framework) AfterEachClb() error {
+	svc, err := f.Client.KubeClient.GetService()
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			klog.Infof("skip delete service, service not found")
+			return nil
+		}
+		return err
+	}
+	if err = f.Client.KubeClient.DeleteService(); err != nil {
+		return fmt.Errorf("delete test service error: %s", err.Error())
+	}
+
+	return f.ExpectLoadBalancerDeleted(svc)
+}
+
+func (f *Framework) AfterEachNlb() error {
 	svc, err := f.Client.KubeClient.GetService()
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -77,26 +102,10 @@ func (f *Framework) AfterEach() error {
 		return err
 	}
 	if err = f.Client.KubeClient.DeleteService(); err != nil {
-		return err
+		return fmt.Errorf("delete service failed: %s", err)
 	}
 
-	remote, err := buildRemoteModel(f, svc)
-	if err != nil {
-		if strings.Contains(err.Error(), "The specified LoadBalancerId does not exist") {
-			//  reuse SLB failed, ignoring cleanup
-			return nil
-		}
-		return err
-	}
-	if svc.Annotations[annotation.Annotation(annotation.LoadBalancerId)] == "" {
-		if remote.LoadBalancerAttribute.LoadBalancerId == "" {
-			return nil
-		} else {
-			return fmt.Errorf("slb %s is not deleted", remote.LoadBalancerAttribute.LoadBalancerId)
-		}
-	} else {
-		return f.ExpectLoadBalancerClean(svc, remote)
-	}
+	return f.ExpectNetworkLoadBalancerDeleted(svc)
 }
 
 func (f *Framework) CreateCloudResource() error {
@@ -105,12 +114,6 @@ func (f *Framework) CreateCloudResource() error {
 	if err != nil {
 		return err
 	}
-
-	zoneMappings, err := parseZoneMappings(options.TestConfig.NLBZoneMaps)
-	if err != nil {
-		return err
-	}
-
 	if options.TestConfig.InternetLoadBalancerID == "" {
 		slbM := &model.LoadBalancer{
 			LoadBalancerAttribute: model.LoadBalancerAttribute{
@@ -193,48 +196,62 @@ func (f *Framework) CreateCloudResource() error {
 		f.CreatedResource[options.TestConfig.IntranetLoadBalancerID] = SLBResource
 	}
 
-	if options.TestConfig.InternetNetworkLoadBalancerID == "" {
-		slbM := &nlbmodel.NetworkLoadBalancer{
-			LoadBalancerAttribute: &nlbmodel.LoadBalancerAttribute{
-				AddressType:  nlbmodel.InternetAddressType,
-				ZoneMappings: zoneMappings,
-				VpcId:        options.TestConfig.VPCID,
-				Name:         fmt.Sprintf("%s-%s-nlb", options.TestConfig.ClusterId, "internet"),
-			},
-		}
-
-		if err := f.Client.CloudClient.FindNLBByName(context.TODO(), slbM); err != nil {
+	if options.TestConfig.EnableNLBTest {
+		zoneMappings, err := parseZoneMappings(options.TestConfig.NLBZoneMaps)
+		if err != nil {
 			return err
 		}
-		if slbM.LoadBalancerAttribute.LoadBalancerId == "" {
-			if err := f.Client.CloudClient.CreateNLB(context.TODO(), slbM); err != nil {
-				return fmt.Errorf("create internet nlb error: %s", err.Error())
+		if options.TestConfig.InternetNetworkLoadBalancerID == "" {
+			slbM := &nlbmodel.NetworkLoadBalancer{
+				LoadBalancerAttribute: &nlbmodel.LoadBalancerAttribute{
+					AddressType:  nlbmodel.InternetAddressType,
+					ZoneMappings: zoneMappings,
+					VpcId:        options.TestConfig.VPCID,
+					Name:         fmt.Sprintf("%s-%s-nlb", options.TestConfig.ClusterId, "internet"),
+				},
 			}
-		}
-		options.TestConfig.InternetNetworkLoadBalancerID = slbM.LoadBalancerAttribute.LoadBalancerId
-		f.CreatedResource[options.TestConfig.InternetNetworkLoadBalancerID] = NLBResource
-	}
 
-	if options.TestConfig.IntranetNetworkLoadBalancerID == "" {
-		slbM := &nlbmodel.NetworkLoadBalancer{
-			LoadBalancerAttribute: &nlbmodel.LoadBalancerAttribute{
-				AddressType:  nlbmodel.IntranetAddressType,
-				ZoneMappings: zoneMappings,
-				VpcId:        options.TestConfig.VPCID,
-				Name:         fmt.Sprintf("%s-%s-nlb", options.TestConfig.ClusterId, "intranet"),
-			},
-		}
-
-		if err := f.Client.CloudClient.FindNLBByName(context.TODO(), slbM); err != nil {
-			return err
-		}
-		if slbM.LoadBalancerAttribute.LoadBalancerId == "" {
-			if err := f.Client.CloudClient.CreateNLB(context.TODO(), slbM); err != nil {
-				return fmt.Errorf("create intranet nlb error: %s", err.Error())
+			if err := f.Client.CloudClient.FindNLBByName(context.TODO(), slbM); err != nil {
+				return err
 			}
+			if slbM.LoadBalancerAttribute.LoadBalancerId == "" {
+				if err := f.Client.CloudClient.CreateNLB(context.TODO(), slbM); err != nil {
+					return fmt.Errorf("create internet nlb error: %s", err.Error())
+				}
+			}
+			options.TestConfig.InternetNetworkLoadBalancerID = slbM.LoadBalancerAttribute.LoadBalancerId
+			f.CreatedResource[options.TestConfig.InternetNetworkLoadBalancerID] = NLBResource
 		}
-		options.TestConfig.IntranetNetworkLoadBalancerID = slbM.LoadBalancerAttribute.LoadBalancerId
-		f.CreatedResource[options.TestConfig.IntranetNetworkLoadBalancerID] = NLBResource
+
+		if options.TestConfig.IntranetNetworkLoadBalancerID == "" {
+			slbM := &nlbmodel.NetworkLoadBalancer{
+				LoadBalancerAttribute: &nlbmodel.LoadBalancerAttribute{
+					AddressType:  nlbmodel.IntranetAddressType,
+					ZoneMappings: zoneMappings,
+					VpcId:        options.TestConfig.VPCID,
+					Name:         fmt.Sprintf("%s-%s-nlb", options.TestConfig.ClusterId, "intranet"),
+				},
+			}
+
+			if err := f.Client.CloudClient.FindNLBByName(context.TODO(), slbM); err != nil {
+				return err
+			}
+			if slbM.LoadBalancerAttribute.LoadBalancerId == "" {
+				if err := f.Client.CloudClient.CreateNLB(context.TODO(), slbM); err != nil {
+					return fmt.Errorf("create intranet nlb error: %s", err.Error())
+				}
+			}
+			options.TestConfig.IntranetNetworkLoadBalancerID = slbM.LoadBalancerAttribute.LoadBalancerId
+			f.CreatedResource[options.TestConfig.IntranetNetworkLoadBalancerID] = NLBResource
+		}
+		if options.TestConfig.CommonBandwidthPackageId == "" {
+			CBP, err := f.Client.CloudClient.CreateCommonBandwidthPackage()
+			if err != nil {
+				return fmt.Errorf("create common bandwidth package error: %s", err.Error())
+			}
+			options.TestConfig.CommonBandwidthPackageId = CBP
+			f.CreatedResource[options.TestConfig.CommonBandwidthPackageId] = CBPResource
+		}
 	}
 
 	if options.TestConfig.AclID == "" {
@@ -312,6 +329,10 @@ func (f *Framework) CleanCloudResources() error {
 			if err := f.Client.CloudClient.DeleteAccessControlList(context.TODO(), key); err != nil {
 				return err
 			}
+		case CBPResource:
+			if err := f.Client.CloudClient.DeleteCommonBandwidthPackage(context.TODO(), key, "true"); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -323,10 +344,103 @@ func (f *Framework) DeleteNetworkLoadBalancer(lbid string) error {
 			LoadBalancerId: lbid,
 		},
 	}
-
-	err := f.Client.CloudClient.DeleteNLB(context.TODO(), slbM)
+	if lbid == "" {
+		klog.Infof("nlb id is empty, skip delete")
+		return fmt.Errorf("DeleteNetworkLoadBalancer but nlb id is empty")
+	}
+	err := f.Client.CloudClient.UpdateLoadBalancerProtection(context.TODO(), lbid,
+		&nlbmodel.DeletionProtectionConfig{Enabled: false}, nil)
 	if err != nil {
+		klog.Errorf("update nlb %s deletion protection error: %s", lbid, err.Error())
+		return err
+	}
+	err = f.Client.CloudClient.DeleteNLB(context.TODO(), slbM)
+	if err != nil {
+		klog.Errorf("delete nlb %s error: %s", lbid, err.Error())
 		return err
 	}
 	return nil
+}
+
+// format: <major>.<minor>.<patch>
+// return versionA >= versionB
+func CompareVersion(versionA, versionB string) bool {
+	defer func() {
+		if r := recover(); r != nil {
+			klog.Errorf("%v %v compareVersion panic %v", versionA, versionB, r)
+			os.Exit(1)
+		}
+	}()
+	klog.Infof("compareVersion %s %s", versionA, versionB)
+	A := strings.TrimLeft(strings.TrimSpace(versionA), "v")
+	B := strings.TrimLeft(strings.TrimSpace(versionB), "v")
+	A = strings.TrimSuffix(A, "-aliyun.1")
+	B = strings.TrimSuffix(B, "-aliyun.1")
+
+	KubeVersion_A := strings.SplitN(A, ".", 3)
+	KubeVersion_B := strings.SplitN(B, ".", 3)
+	for len(KubeVersion_A) < 3 {
+		KubeVersion_A = append(KubeVersion_A, "0")
+	}
+	for len(KubeVersion_B) < 3 {
+		KubeVersion_B = append(KubeVersion_B, "0")
+	}
+
+	klog.Infof("compareVersion %s %s", KubeVersion_A, KubeVersion_B)
+	major_a, err := strconv.Atoi(KubeVersion_A[0])
+	if err != nil {
+		klog.Errorf("compareVersion Atoi %s", err)
+	}
+	major_b, err := strconv.Atoi(KubeVersion_B[0])
+	if err != nil {
+		klog.Errorf("compareVersion Atoi %s", err)
+	}
+	if major_a > major_b {
+		klog.Infof("compareVersion %s >= %s true", KubeVersion_A, KubeVersion_B)
+		return true
+	} else if major_a < major_b {
+		return false
+	} else {
+		minor_a, err := strconv.Atoi(KubeVersion_A[1])
+		if err != nil {
+			klog.Errorf("compareVersion Atoi %s", err)
+		}
+		minor_b, err := strconv.Atoi(KubeVersion_B[1])
+		if err != nil {
+			klog.Errorf("compareVersion Atoi %s", err)
+		}
+		if minor_a > minor_b {
+			klog.Infof("compareVersion %s >= %s true", KubeVersion_A, KubeVersion_B)
+			return true
+		} else if minor_a < minor_b {
+			return false
+		} else {
+			patch_a, err := strconv.Atoi(KubeVersion_A[2])
+			if err != nil {
+				klog.Errorf("compareVersion Atoi %s", err)
+			}
+			patch_b, err := strconv.Atoi(KubeVersion_B[2])
+			if err != nil {
+				klog.Errorf("compareVersion Atoi %s", err)
+			}
+			if patch_a >= patch_b {
+				klog.Infof("compareVersion %s >= %s true", KubeVersion_A, KubeVersion_B)
+				return true
+			} else {
+				klog.Infof("compareVersion %s >= %s false", KubeVersion_A, KubeVersion_B)
+				return false
+			}
+		}
+	}
+
+}
+
+func EnableReadinessGate() bool {
+	// terway
+	// Cloud Controller Manager >= v2.10.0
+	// cluster >= v1.24.0
+	network := tea.StringValue(options.TestConfig.AckCluster.Parameters["Network"])
+	clusterVersion := tea.StringValue(options.TestConfig.AckCluster.CurrentVersion)
+	ccmVersion := options.TestConfig.CCM_Version
+	return strings.Contains(network, "terway") && CompareVersion(clusterVersion, "v1.24.0") && CompareVersion(ccmVersion, "v2.10.0")
 }

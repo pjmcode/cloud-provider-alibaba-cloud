@@ -3,6 +3,9 @@ package vpc
 import (
 	"context"
 	"fmt"
+	"net"
+	"strings"
+
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/requests"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/vpc"
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/model"
@@ -10,8 +13,6 @@ import (
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/provider/alibaba/base"
 	"k8s.io/cloud-provider-alibaba-cloud/pkg/provider/alibaba/util"
 	"k8s.io/klog/v2"
-	"net"
-	"strings"
 )
 
 type AssociatedInstanceType string
@@ -340,4 +341,60 @@ func (r *VPCProvider) DescribeRouteTableList(ctx context.Context, vpcId string) 
 		rtIds = append(rtIds, rt.RouteTableId)
 	}
 	return rtIds, nil
+}
+
+// DescribeIpv6Gateways used for e2etest
+func (r *VPCProvider) DescribeIpv6Gateways(ctx context.Context, vpcId string) ([]vpc.Ipv6Gateway, error) {
+	req := vpc.CreateDescribeIpv6GatewaysRequest()
+	req.VpcId = vpcId
+	resp, err := r.auth.VPC.DescribeIpv6Gateways(req)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Ipv6Gateways.Ipv6Gateway, nil
+}
+
+// DescribeCommonBandwidthPackages used for e2etest
+func (r *VPCProvider) DescribeCommonBandwidthPackages() ([]vpc.CommonBandwidthPackage, error) {
+	req := vpc.CreateDescribeCommonBandwidthPackagesRequest()
+	resp, err := r.auth.VPC.DescribeCommonBandwidthPackages(req)
+	if err != nil {
+		return nil, err
+	}
+	return resp.CommonBandwidthPackages.CommonBandwidthPackage, nil
+}
+
+// CreateCommonBandwidthPackage used for e2etest
+func (r *VPCProvider) CreateCommonBandwidthPackage() (string, error) {
+	req := vpc.CreateCreateCommonBandwidthPackageRequest()
+	req.Bandwidth = requests.NewInteger(2)
+	req.InternetChargeType = "PayByDominantTraffic"
+	resp, err := r.auth.VPC.CreateCommonBandwidthPackage(req)
+	if err != nil {
+		return "", err
+	}
+	return resp.BandwidthPackageId, nil
+}
+
+// CreateIpv6Gateway used for e2etest
+func (r *VPCProvider) CreateIpv6Gateway(ctx context.Context, vpc_id string) (string, error) {
+	req := vpc.CreateCreateIpv6GatewayRequest()
+	req.VpcId = vpc_id
+	resp, err := r.auth.VPC.CreateIpv6Gateway(req)
+	if err != nil {
+		return "", err
+	}
+	return resp.Ipv6GatewayId, nil
+}
+
+// DeleteCommonBandwidthPackage used for e2etest
+func (r *VPCProvider) DeleteCommonBandwidthPackage(ctx context.Context, bandwidthPackageId, force string) error {
+	req := vpc.CreateDeleteCommonBandwidthPackageRequest()
+	req.BandwidthPackageId = bandwidthPackageId
+	req.Force = force
+	_, err := r.auth.VPC.DeleteCommonBandwidthPackage(req)
+	if err != nil {
+		return fmt.Errorf("DeleteCommonBandwidthPackage %s: %v", bandwidthPackageId, err)
+	}
+	return nil
 }
